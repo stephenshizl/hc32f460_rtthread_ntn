@@ -73,6 +73,17 @@
 #define NTN_BOOT_PIN        GET_PIN(A, 10)  /* MCU_NTN_BOOT: PA10 */
 #define PA_PWREN_PIN        GET_PIN(B, 0)   /* PA_PWREN: PB0, High to enable PA power */
 
+/************************ GNSS / RNSS Module Pins **********************/
+#define RNSS_PWR_EN_PIN     GET_PIN(H, 2)   /* RNSS_PWR_EN: PH2, High active (SGM2032 LDO 3.3V) */
+#define RNSS_RST_PIN        GET_PIN(C, 13)  /* RNSS_RST: PC13, Low active reset */
+
+/************************ BLE Bluetooth Module Pins **********************/
+#define BT_PWR_EN_PIN       GET_PIN(B, 9)   /* MCU_BT_EN: PB9, High active (SGM2032 LDO 3.3V) */
+
+/************************ Board Status LED Pins **********************/
+#define PIN_LED_POWER_OK    GET_PIN(A, 6)   /* POWER_OK: PA6, High active */
+#define PIN_LED_NET_OK      GET_PIN(A, 5)   /* NET_OK: PA5, High active */
+
 /************************ I2C port **********************/
 #if defined(BSP_USING_I2C1)
 #define I2C1_SDA_PORT (GPIO_PORT_A)

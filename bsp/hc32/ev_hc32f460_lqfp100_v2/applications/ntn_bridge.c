@@ -35,43 +35,14 @@ static volatile rt_uint32_t stat_ntn_tx_bytes = 0;
 /* Status flags */
 static rt_bool_t bridge_running = RT_FALSE;
 
+#include "hw_power.h"
+
 /**
  * @brief  Initialize NTN hardware control GPIOs
  */
 void ntn_hw_init(void)
 {
-    LOG_I("Initializing NTN module hardware control pins...");
-
-    /* 1. NTN Module Boot Pin: PA10 (Output Low = normal boot) */
-    rt_pin_mode(NTN_BOOT_PIN, PIN_MODE_OUTPUT);
-    rt_pin_write(NTN_BOOT_PIN, PIN_LOW);
-
-    /* 2. NTN Wakeup Pin: PA15 (Output High = active) */
-    rt_pin_mode(NTN_WAKEUP_PIN, PIN_MODE_OUTPUT);
-    rt_pin_write(NTN_WAKEUP_PIN, PIN_HIGH);
-
-    /* 3. NTN Status Pin: PB3 (Input) */
-    rt_pin_mode(NTN_STATUS_PIN, PIN_MODE_INPUT);
-
-    /* 4. NTN Reset Pin: PA8 (Active High on MCU turns on Q3 to pull ST1000 RESETN low) */
-    rt_pin_mode(NTN_RST_PIN, PIN_MODE_OUTPUT);
-    rt_pin_write(NTN_RST_PIN, PIN_HIGH); /* Hold in reset initially */
-
-    /* 5. NTN Power Enable Pin: PB15 (Active High turns on Q7102 -> Q1 PMOS -> VCC_ST1000) */
-    rt_pin_mode(NTN_PWR_EN_PIN, PIN_MODE_OUTPUT);
-    rt_pin_write(NTN_PWR_EN_PIN, PIN_HIGH); /* Turn on NTN module power */
-
-    /* 6. RF PA Power Enable Pin: PB0 (Active High enables LMR14030 -> VCC_PA) */
-    rt_pin_mode(PA_PWREN_PIN, PIN_MODE_OUTPUT);
-    rt_pin_write(PA_PWREN_PIN, PIN_HIGH);   /* Turn on PA power */
-
-    /* Wait 100ms for power rail stability */
-    rt_thread_mdelay(100);
-
-    /* Release reset: set PA8 LOW so Q3 turns off, ST1000 RESETN pulled up */
-    rt_pin_write(NTN_RST_PIN, PIN_LOW);
-    LOG_I("NTN hardware power and reset released, module booting...");
-
+    hw_power_init();
     /* Wait for module UART ready */
     rt_thread_mdelay(500);
 }
@@ -81,22 +52,7 @@ void ntn_hw_init(void)
  */
 void ntn_power_control(rt_bool_t on)
 {
-    if (on)
-    {
-        rt_pin_write(NTN_PWR_EN_PIN, PIN_HIGH);
-        rt_pin_write(PA_PWREN_PIN, PIN_HIGH);
-        rt_pin_write(NTN_WAKEUP_PIN, PIN_HIGH);
-        rt_thread_mdelay(100);
-        rt_pin_write(NTN_RST_PIN, PIN_LOW);
-        LOG_I("NTN module power ON");
-    }
-    else
-    {
-        rt_pin_write(NTN_RST_PIN, PIN_HIGH); /* Hold in reset */
-        rt_pin_write(PA_PWREN_PIN, PIN_LOW);  /* Turn off PA */
-        rt_pin_write(NTN_PWR_EN_PIN, PIN_LOW);/* Turn off NTN power */
-        LOG_I("NTN module power OFF");
-    }
+    hw_power_ntn_set(on);
 }
 
 /**
@@ -104,11 +60,7 @@ void ntn_power_control(rt_bool_t on)
  */
 void ntn_reset(void)
 {
-    LOG_I("Resetting NTN module...");
-    rt_pin_write(NTN_RST_PIN, PIN_HIGH);
-    rt_thread_mdelay(200);
-    rt_pin_write(NTN_RST_PIN, PIN_LOW);
-    LOG_I("NTN module reset pulse finished");
+    hw_reset_ntn(200);
 }
 
 /**
@@ -116,7 +68,7 @@ void ntn_reset(void)
  */
 int ntn_get_status_pin(void)
 {
-    return rt_pin_read(NTN_STATUS_PIN);
+    return hw_ntn_status_get();
 }
 
 /**
