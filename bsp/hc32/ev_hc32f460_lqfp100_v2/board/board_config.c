@@ -22,11 +22,25 @@ rt_err_t rt_hw_board_uart_init(CM_USART_TypeDef *USARTx)
 
     switch ((rt_uint32_t)USARTx)
     {
+#if defined(BSP_USING_UART1)
+    case (rt_uint32_t)CM_USART1:
+        /* Configure USART RX/TX pin. */
+        GPIO_SetFunc(USART1_RX_PORT, USART1_RX_PIN, USART1_RX_FUNC);
+        GPIO_SetFunc(USART1_TX_PORT, USART1_TX_PIN, USART1_TX_FUNC);
+        break;
+#endif
 #if defined(BSP_USING_UART2)
     case (rt_uint32_t)CM_USART2:
         /* Configure USART RX/TX pin. */
         GPIO_SetFunc(USART2_RX_PORT, USART2_RX_PIN, USART2_RX_FUNC);
         GPIO_SetFunc(USART2_TX_PORT, USART2_TX_PIN, USART2_TX_FUNC);
+        break;
+#endif
+#if defined(BSP_USING_UART3)
+    case (rt_uint32_t)CM_USART3:
+        /* Configure USART RX/TX pin. */
+        GPIO_SetFunc(USART3_RX_PORT, USART3_RX_PIN, USART3_RX_FUNC);
+        GPIO_SetFunc(USART3_TX_PORT, USART3_TX_PIN, USART3_TX_FUNC);
         break;
 #endif
 #if defined(BSP_USING_UART4)

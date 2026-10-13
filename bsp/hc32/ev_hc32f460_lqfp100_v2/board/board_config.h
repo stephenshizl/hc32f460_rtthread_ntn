@@ -25,25 +25,53 @@
 #define XTAL_OUT_PIN (GPIO_PIN_00)
 
 /************************ USART port **********************/
+#if defined(BSP_USING_UART1)
+#define USART1_RX_PORT (GPIO_PORT_A)
+#define USART1_RX_PIN  (GPIO_PIN_00)
+#define USART1_RX_FUNC (GPIO_FUNC_33)
+
+#define USART1_TX_PORT (GPIO_PORT_A)
+#define USART1_TX_PIN  (GPIO_PIN_01)
+#define USART1_TX_FUNC (GPIO_FUNC_32)
+#endif
+
 #if defined(BSP_USING_UART2)
 #define USART2_RX_PORT (GPIO_PORT_A)
 #define USART2_RX_PIN  (GPIO_PIN_03)
 #define USART2_RX_FUNC (GPIO_FUNC_37)
 
 #define USART2_TX_PORT (GPIO_PORT_A)
-#define USART2_TX_PIN  (GPIO_PIN_02)
+#define USART2_TX_PIN  (GPIO_PIN_04)
 #define USART2_TX_FUNC (GPIO_FUNC_36)
+#endif
+
+#if defined(BSP_USING_UART3)
+#define USART3_RX_PORT (GPIO_PORT_B)
+#define USART3_RX_PIN  (GPIO_PIN_05)
+#define USART3_RX_FUNC (GPIO_FUNC_33)
+
+#define USART3_TX_PORT (GPIO_PORT_B)
+#define USART3_TX_PIN  (GPIO_PIN_04)
+#define USART3_TX_FUNC (GPIO_FUNC_32)
 #endif
 
 #if defined(BSP_USING_UART4)
 #define USART4_RX_PORT (GPIO_PORT_B)
-#define USART4_RX_PIN  (GPIO_PIN_09)
+#define USART4_RX_PIN  (GPIO_PIN_07)
 #define USART4_RX_FUNC (GPIO_FUNC_37)
 
-#define USART4_TX_PORT (GPIO_PORT_E)
+#define USART4_TX_PORT (GPIO_PORT_B)
 #define USART4_TX_PIN  (GPIO_PIN_06)
 #define USART4_TX_FUNC (GPIO_FUNC_36)
 #endif
+
+/************************ NTN Module Pins **********************/
+#define NTN_PWR_EN_PIN      GET_PIN(B, 15)  /* MCU_NTN_PWR_EN: PB15, High active */
+#define NTN_RST_PIN         GET_PIN(A, 8)   /* MCU_NTN_RST: PA8, High to reset, Low to run */
+#define NTN_WAKEUP_PIN      GET_PIN(A, 15)  /* MCU_WAKEUP_NTN: PA15 */
+#define NTN_STATUS_PIN      GET_PIN(B, 3)   /* NTN_MCU_STATUS: PB3 */
+#define NTN_BOOT_PIN        GET_PIN(A, 10)  /* MCU_NTN_BOOT: PA10 */
+#define PA_PWREN_PIN        GET_PIN(B, 0)   /* PA_PWREN: PB0, High to enable PA power */
 
 /************************ I2C port **********************/
 #if defined(BSP_USING_I2C1)

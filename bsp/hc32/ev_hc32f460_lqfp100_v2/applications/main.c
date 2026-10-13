@@ -12,20 +12,40 @@
 #include <rtdevice.h>
 #include <board.h>
 
-/* defined the LED_GREEN pin: PD4 */
-#define LED_GREEN_PIN GET_PIN(D, 4)
+#include "ntn_bridge.h"
 
+/* Board Status LED pins */
+#define PIN_LED_POWER_OK    GET_PIN(A, 6)   /* POWER_OK: PA6 */
+#define PIN_LED_NET_OK      GET_PIN(A, 5)   /* NET_OK: PA5 */
 
 int main(void)
 {
-    /* set LED_GREEN_PIN pin mode to output */
-    rt_pin_mode(LED_GREEN_PIN, PIN_MODE_OUTPUT);
+    /* Initialize board status LEDs */
+    rt_pin_mode(PIN_LED_POWER_OK, PIN_MODE_OUTPUT);
+    rt_pin_mode(PIN_LED_NET_OK, PIN_MODE_OUTPUT);
+
+    rt_pin_write(PIN_LED_POWER_OK, PIN_HIGH);
+    rt_pin_write(PIN_LED_NET_OK, PIN_LOW);
+
+    /* Initialize PC <-> MCU <-> NTN transparent pass-through bridge */
+    ntn_bridge_init();
 
     while (1)
     {
-        rt_pin_write(LED_GREEN_PIN, PIN_HIGH);
+        /* Reflect NTN network status pin on NET_OK LED */
+        if (ntn_get_status_pin())
+        {
+            rt_pin_write(PIN_LED_NET_OK, PIN_HIGH);
+        }
+        else
+        {
+            rt_pin_write(PIN_LED_NET_OK, PIN_LOW);
+        }
+
+        /* Power LED heartbeat */
+        rt_pin_write(PIN_LED_POWER_OK, PIN_HIGH);
         rt_thread_mdelay(500);
-        rt_pin_write(LED_GREEN_PIN, PIN_LOW);
+        rt_pin_write(PIN_LED_POWER_OK, PIN_LOW);
         rt_thread_mdelay(500);
     }
 }
