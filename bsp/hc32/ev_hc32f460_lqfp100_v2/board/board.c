@@ -32,6 +32,10 @@ void SystemBase_Config(void)
      * - PB4  (NJTRST) -> MCU_UART3_TXD  (USART3_TX to NTN MS150)
      */
     GPIO_SetDebugPort(GPIO_PIN_TDO | GPIO_PIN_TDI | GPIO_PIN_TRST, DISABLE);
+
+    /* Initialize SEGGER RTT device early before rt_console_set_device() in rt_hw_board_init */
+    extern int rt_hw_rtt_init(void);
+    rt_hw_rtt_init();
 }
 
 /** System Clock Configuration

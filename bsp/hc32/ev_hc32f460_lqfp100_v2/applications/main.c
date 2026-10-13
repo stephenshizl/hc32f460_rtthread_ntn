@@ -20,6 +20,8 @@
 
 int main(void)
 {
+    rt_kprintf("\r\n[SYS] NTN System Main Thread Started...\r\n");
+
     /* Initialize board status LEDs */
     rt_pin_mode(PIN_LED_POWER_OK, PIN_MODE_OUTPUT);
     rt_pin_mode(PIN_LED_NET_OK, PIN_MODE_OUTPUT);
