@@ -66,6 +66,10 @@ Export('SDK_LIB')
 # prepare building environment
 objs = PrepareBuilding(env, RTT_ROOT, has_libcpu=False)
 
+if rtconfig.PLATFORM in ['armcc', 'armclang']:
+    env['ASCOM'] = '$AS $ASFLAGS -o $TARGET $SOURCES'
+    env['ASPPCOM'] = env['ASCOM']
+
 rtconfig.BSP_LIBRARY_TYPE = None
 
 # include drivers

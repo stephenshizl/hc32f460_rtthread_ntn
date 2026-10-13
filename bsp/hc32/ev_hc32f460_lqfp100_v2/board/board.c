@@ -24,6 +24,14 @@ void SystemBase_Config(void)
 #if defined(BSP_USING_ON_CHIP_FLASH_CACHE)
     EFM_CacheCmd(ENABLE);
 #endif
+
+    /*
+     * Release JTAG pins to GPIO/multiplexed peripherals, keep SWD (PA13/PA14) for debugging:
+     * - PB3  (JTDO)   -> NTN_MCU_STATUS (GPIO input)
+     * - PA15 (JTDI)   -> MCU_WAKEUP_NTN (GPIO output)
+     * - PB4  (NJTRST) -> MCU_UART3_TXD  (USART3_TX to NTN MS150)
+     */
+    GPIO_SetDebugPort(GPIO_PIN_TDO | GPIO_PIN_TDI | GPIO_PIN_TRST, DISABLE);
 }
 
 /** System Clock Configuration
