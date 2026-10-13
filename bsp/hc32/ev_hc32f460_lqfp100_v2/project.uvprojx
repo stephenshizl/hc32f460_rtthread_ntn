@@ -334,7 +334,7 @@
             <v6Rtti>0</v6Rtti>
             <VariousControls>
               <MiscControls />
-              <Define>__STDC_LIMIT_MACROS, __CLK_TCK=RT_TICK_PER_SECOND, RT_USING_ARMLIBC, __RTTHREAD__, HC32F460, RT_USING_LIBC, USE_DDL_DRIVER, __DEBUG</Define>
+              <Define>RT_USING_ARMLIBC, __CLK_TCK=RT_TICK_PER_SECOND, USE_DDL_DRIVER, RT_USING_LIBC, __STDC_LIMIT_MACROS, __RTTHREAD__, HC32F460, __DEBUG</Define>
               <Undefine />
               <IncludePath>.;applications;applications\segger_rtt;board;board\ports;board\config;board\config\usb_config;packages\hc32-f4-cmsis-latest\Include;packages\hc32-f4-cmsis-latest\Device\HDSC\hc32f460\Include;packages\hc32-f4-series-latest\hc32f460\inc;..\..\..\include;..\..\..\libcpu\arm\common;..\..\..\libcpu\arm\cortex-m4;..\..\..\components\drivers\include;..\..\..\components\drivers\smp_call;..\..\..\components\finsh;..\..\..\components\libc\compilers\common\include;..\..\..\components\libc\compilers\common\extension;..\..\..\components\libc\compilers\common\extension\fcntl\octal;..\..\..\components\libc\posix\io\epoll;..\..\..\components\libc\posix\io\eventfd;..\..\..\components\libc\posix\io\poll;..\..\..\components\libc\posix\ipc;..\..\..\components\net\utest;..\libraries\hc32_drivers;..\tests</IncludePath>
             </VariousControls>
@@ -384,6 +384,13 @@
               <FileName>ble_uart.c</FileName>
               <FileType>1</FileType>
               <FilePath>applications\ble_uart.c</FilePath>
+            </File>
+          </Files>
+          <Files>
+            <File>
+              <FileName>gnss_um220.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>applications\gnss_um220.c</FilePath>
             </File>
           </Files>
           <Files>

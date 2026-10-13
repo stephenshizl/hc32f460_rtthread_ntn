@@ -221,6 +221,7 @@
 #define BSP_USING_GPIO
 #define BSP_USING_UART
 #define BSP_USING_UART1
+#define BSP_USING_UART2
 #define BSP_USING_UART3
 #define BSP_USING_UART4
 #define BSP_USING_I2C
