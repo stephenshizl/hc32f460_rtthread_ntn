@@ -6,7 +6,7 @@
  * Change Logs:
  * Date           Author       Notes
  * 2022-04-28     CDT          first version
- * 2026-10-13     Stephen      Integrate unified hw_power manager and status monitoring
+ * 2026-10-13     Stephen      Integrate PC RS232 (uart1, 19200/8N1, idle framing)
  */
 
 #include <rtthread.h>
@@ -14,17 +14,23 @@
 #include <board.h>
 
 #include "hw_power.h"
-#include "ntn_bridge.h"
+#include "pc_rs232.h"
 
 int main(void)
 {
     rt_kprintf("\r\n[SYS] NTN System Main Thread Started...\r\n");
 
-    /* Initialize hardware power rails and peripheral GPIOs */
+    /* 1. Initialize hardware power rails and peripheral GPIOs */
     hw_power_init();
 
-    /* Initialize PC <-> MCU <-> NTN transparent pass-through bridge */
-    ntn_bridge_init();
+    /* 2. Initialize PC RS232 communication interface (uart1, 19200/8N1) */
+    pc_rs232_init();
+
+    /* Send boot banner to PC RS232 */
+    pc_rs232_send_str("\r\n======================================================\r\n");
+    pc_rs232_send_str("  Iridium NTN Smart Terminal - PC RS232 Port Ready    \r\n");
+    pc_rs232_send_str("  UART: uart1 (PA0-RX, PA1-TX) @ 19200 bps 8N1       \r\n");
+    pc_rs232_send_str("======================================================\r\n\r\n");
 
     while (1)
     {
