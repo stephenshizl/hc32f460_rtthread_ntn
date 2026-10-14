@@ -6,6 +6,8 @@
  * Change Logs:
  * Date           Author       Notes
  * 2026-10-13     Stephen      First version: GNSS (Beidou/GPS) UM220-IV-M driver
+ * 2026-10-14     Stephen      Enhanced with TankerFlow NMEA engine: fixed-point E7,
+ *                             zero-copy field parsing, freshness check, cm/s speed
  */
 
 #include "gnss_um220.h"
@@ -21,7 +23,24 @@
 #define GNSS_THREAD_STACK_SZ    2048
 #define GNSS_THREAD_PRIO        12
 
-#define NMEA_FIELD_MAX_LEN      32
+#define NMEA_MAX_FIELDS         20
+
+/* Zero-copy slice referencing field within sentence buffer */
+typedef struct
+{
+    const char  *ptr;
+    rt_uint8_t   length;
+} nmea_field_t;
+
+/* Parsing result codes */
+typedef enum
+{
+    NMEA_RES_OK_RMC = 0,
+    NMEA_RES_OK_GGA,
+    NMEA_RES_UNSUPPORTED,
+    NMEA_RES_CHECKSUM_ERROR,
+    NMEA_RES_FORMAT_ERROR
+} nmea_res_t;
 
 static rt_device_t              _gnss_dev          = RT_NULL;
 static struct rt_semaphore      _sem_rx;
@@ -29,324 +48,569 @@ static struct rt_mutex          _mutex_data;
 static rt_thread_t              _rx_thread         = RT_NULL;
 
 static gnss_data_t              _gnss_data;
+static gnss_stats_t             _gnss_stats;
 static gnss_sentence_handler_t  _sentence_handler  = RT_NULL;
 static rt_bool_t                _raw_log           = RT_FALSE;
 static rt_bool_t                _inited            = RT_FALSE;
 
-/* Diagnostic statistics */
-static volatile rt_uint32_t     _stat_rx_bytes     = 0;
-static volatile rt_uint32_t     _stat_sentences    = 0;
-static volatile rt_uint32_t     _stat_crc_err      = 0;
-static volatile rt_uint32_t     _stat_gga_count    = 0;
-static volatile rt_uint32_t     _stat_rmc_count    = 0;
+/* ------------------- High-Robustness NMEA Parsing Engine ------------------- */
 
-/**
- * @brief Calculate and verify NMEA checksum
- * @param sentence Sentence string starting with '$' and containing '*'
- * @return RT_TRUE if checksum matches, RT_FALSE otherwise
- */
-static rt_bool_t nmea_verify_checksum(const char *sentence)
+static rt_uint8_t nmea_hex_val(char ch, rt_uint8_t *val)
 {
-    const char *p = sentence;
-    rt_uint8_t calc_crc = 0;
-    rt_uint32_t expected_crc = 0;
-
-    if (!sentence || *sentence != '$')
+    if ((ch >= '0') && (ch <= '9'))
     {
-        return RT_FALSE;
+        *val = (rt_uint8_t)(ch - '0');
+        return 1U;
     }
-
-    p++; /* Skip '$' */
-
-    while (*p && *p != '*' && *p != '\r' && *p != '\n')
+    if ((ch >= 'A') && (ch <= 'F'))
     {
-        calc_crc ^= (rt_uint8_t)(*p);
-        p++;
+        *val = (rt_uint8_t)(ch - 'A' + 10);
+        return 1U;
     }
-
-    if (*p != '*')
+    if ((ch >= 'a') && (ch <= 'f'))
     {
-        return RT_FALSE;
+        *val = (rt_uint8_t)(ch - 'a' + 10);
+        return 1U;
     }
-
-    p++; /* Skip '*' */
-
-    if (*p == '\0')
-    {
-        return RT_FALSE;
-    }
-
-    /* Convert hex checksum */
-    char crc_str[3] = {0};
-    crc_str[0] = p[0];
-    if (p[1] != '\0' && p[1] != '\r' && p[1] != '\n')
-    {
-        crc_str[1] = p[1];
-    }
-    expected_crc = (rt_uint32_t)strtoul(crc_str, RT_NULL, 16);
-
-    return (calc_crc == (rt_uint8_t)expected_crc) ? RT_TRUE : RT_FALSE;
+    return 0U;
 }
 
-/**
- * @brief Extract the next comma-separated field from an NMEA sentence
- * @param s Pointer to current position in string
- * @param field Output buffer for the field
- * @param max_len Size of output buffer
- * @return Pointer to start of next field, or RT_NULL if end of sentence reached
- */
-static const char *nmea_next_field(const char *s, char *field, rt_size_t max_len)
+static rt_uint8_t nmea_parse_uint(const nmea_field_t *field, rt_uint32_t *val)
 {
-    rt_size_t idx = 0;
+    rt_uint32_t res = 0U;
 
-    if (!s)
+    if (!field || !val || field->length == 0U)
     {
-        if (field && max_len > 0)
+        return 0U;
+    }
+
+    for (rt_uint8_t i = 0U; i < field->length; i++)
+    {
+        char ch = field->ptr[i];
+        if ((ch < '0') || (ch > '9'))
         {
-            field[0] = '\0';
+            return 0U;
         }
-        return RT_NULL;
-    }
-
-    while (*s && *s != ',' && *s != '*' && *s != '\r' && *s != '\n')
-    {
-        if (idx < max_len - 1)
+        rt_uint32_t digit = (rt_uint32_t)(ch - '0');
+        if ((res > 429496729U) || ((res == 429496729U) && (digit > 5U)))
         {
-            field[idx++] = *s;
+            return 0U; /* Overflow prevention */
         }
-        s++;
+        res = (res * 10U) + digit;
     }
 
-    if (field && max_len > 0)
+    *val = res;
+    return 1U;
+}
+
+static rt_uint8_t nmea_parse_time(const nmea_field_t *field,
+                                  rt_uint8_t *hour,
+                                  rt_uint8_t *minute,
+                                  rt_uint8_t *second)
+{
+    if (!field || !hour || !minute || !second || (field->length < 6U))
     {
-        field[idx] = '\0';
+        return 0U;
     }
 
-    if (*s == ',')
+    for (rt_uint8_t i = 0U; i < 6U; i++)
     {
-        return s + 1; /* Position at start of next field */
+        if ((field->ptr[i] < '0') || (field->ptr[i] > '9'))
+        {
+            return 0U;
+        }
+    }
+    if ((field->length > 6U) && (field->ptr[6] != '.'))
+    {
+        return 0U;
     }
 
-    return RT_NULL; /* End of sentence reached */
+    rt_uint8_t hh = (rt_uint8_t)(((field->ptr[0] - '0') * 10) + (field->ptr[1] - '0'));
+    rt_uint8_t mm = (rt_uint8_t)(((field->ptr[2] - '0') * 10) + (field->ptr[3] - '0'));
+    rt_uint8_t ss = (rt_uint8_t)(((field->ptr[4] - '0') * 10) + (field->ptr[5] - '0'));
+
+    /* Second up to 60 for leap seconds */
+    if ((hh > 23U) || (mm > 59U) || (ss > 60U))
+    {
+        return 0U;
+    }
+
+    *hour   = hh;
+    *minute = mm;
+    *second = ss;
+    return 1U;
+}
+
+static rt_uint8_t nmea_parse_date(const nmea_field_t *field,
+                                  rt_uint16_t *year,
+                                  rt_uint8_t *month,
+                                  rt_uint8_t *day)
+{
+    if (!field || !year || !month || !day || (field->length != 6U))
+    {
+        return 0U;
+    }
+
+    for (rt_uint8_t i = 0U; i < 6U; i++)
+    {
+        if ((field->ptr[i] < '0') || (field->ptr[i] > '9'))
+        {
+            return 0U;
+        }
+    }
+
+    rt_uint8_t dd = (rt_uint8_t)(((field->ptr[0] - '0') * 10) + (field->ptr[1] - '0'));
+    rt_uint8_t mm = (rt_uint8_t)(((field->ptr[2] - '0') * 10) + (field->ptr[3] - '0'));
+    rt_uint8_t yy = (rt_uint8_t)(((field->ptr[4] - '0') * 10) + (field->ptr[5] - '0'));
+
+    if ((dd == 0U) || (dd > 31U) || (mm == 0U) || (mm > 12U))
+    {
+        return 0U;
+    }
+
+    *day   = dd;
+    *month = mm;
+    *year  = (yy >= 80U) ? (rt_uint16_t)(1900U + yy) : (rt_uint16_t)(2000U + yy);
+    return 1U;
 }
 
 /**
- * @brief Convert NMEA coordinate (ddmm.mmmm / dddmm.mmmm) to decimal degrees
- * @param str NMEA coordinate string
- * @return Decimal degrees value
+ * @brief Parse coordinate into fixed-point 10^7 scale without float calculation
+ * @param field Pointer to field slice (e.g. "3112.3456" or "12130.4567")
+ * @param hemisphere 'N', 'S', 'E', or 'W'
+ * @param degree_digits 2 for latitude, 3 for longitude
+ * @param value_e7 Output integer scaled by 10^7
  */
-static double nmea_coord_to_deg(const char *str)
+static rt_uint8_t nmea_parse_coordinate(const nmea_field_t *field,
+                                        char hemisphere,
+                                        rt_uint8_t degree_digits,
+                                        rt_int32_t *value_e7)
 {
-    if (!str || *str == '\0')
+    rt_uint8_t dot_index;
+    rt_uint8_t fraction_digits;
+    rt_uint32_t degrees;
+    rt_uint32_t minutes;
+    rt_uint32_t minute_fraction_e7;
+    rt_uint32_t coordinate_e7;
+    rt_uint32_t scale;
+
+    if (!field || !value_e7 || (field->length < (rt_uint8_t)(degree_digits + 2U)))
     {
-        return 0.0;
+        return 0U;
     }
 
-    double raw = atof(str);
-    int deg = (int)(raw / 100.0);
-    double min = raw - ((double)deg * 100.0);
+    dot_index = field->length;
+    for (rt_uint8_t i = 0U; i < field->length; i++)
+    {
+        char ch = field->ptr[i];
+        if (ch == '.')
+        {
+            if (dot_index != field->length)
+            {
+                return 0U; /* Duplicate dots */
+            }
+            dot_index = i;
+        }
+        else if ((ch < '0') || (ch > '9'))
+        {
+            return 0U;
+        }
+    }
 
-    return (double)deg + (min / 60.0);
+    if (dot_index != (rt_uint8_t)(degree_digits + 2U))
+    {
+        return 0U;
+    }
+
+    degrees = 0U;
+    for (rt_uint8_t i = 0U; i < degree_digits; i++)
+    {
+        degrees = (degrees * 10U) + (rt_uint32_t)(field->ptr[i] - '0');
+    }
+
+    minutes = (rt_uint32_t)((field->ptr[degree_digits] - '0') * 10) +
+              (rt_uint32_t)(field->ptr[degree_digits + 1U] - '0');
+    if (minutes >= 60U)
+    {
+        return 0U;
+    }
+    if (((degree_digits == 2U) && (degrees > 90U)) ||
+        ((degree_digits == 3U) && (degrees > 180U)))
+    {
+        return 0U;
+    }
+
+    minute_fraction_e7 = 0U;
+    fraction_digits = 0U;
+    if (dot_index < field->length)
+    {
+        for (rt_uint8_t i = (rt_uint8_t)(dot_index + 1U); i < field->length; i++)
+        {
+            if (fraction_digits < 7U)
+            {
+                minute_fraction_e7 = (minute_fraction_e7 * 10U) + (rt_uint32_t)(field->ptr[i] - '0');
+                fraction_digits++;
+            }
+        }
+    }
+
+    scale = 1U;
+    while (fraction_digits < 7U)
+    {
+        scale *= 10U;
+        fraction_digits++;
+    }
+    minute_fraction_e7 *= scale;
+
+    if (((degree_digits == 2U) && (degrees == 90U) && ((minutes != 0U) || (minute_fraction_e7 != 0U))) ||
+        ((degree_digits == 3U) && (degrees == 180U) && ((minutes != 0U) || (minute_fraction_e7 != 0U))))
+    {
+        return 0U;
+    }
+
+    /* Fixed-point arithmetic: 1 minute = 1/60 degree */
+    coordinate_e7 = (degrees * GNSS_E7_SCALE) +
+                    (((minutes * GNSS_E7_SCALE) + minute_fraction_e7) / 60U);
+
+    if ((hemisphere == 'S') || (hemisphere == 'W'))
+    {
+        *value_e7 = -(rt_int32_t)coordinate_e7;
+    }
+    else if ((hemisphere == 'N') || (hemisphere == 'E'))
+    {
+        *value_e7 = (rt_int32_t)coordinate_e7;
+    }
+    else
+    {
+        return 0U;
+    }
+
+    return 1U;
 }
 
 /**
- * @brief Parse GGA sentence ($GNGGA, $GPGGA, $BDGGA)
- * Format: $xxGGA,time,lat,lat_dir,lon,lon_dir,quality,num_sats,hdop,alt,M,geoid,M,age,ref*cs
+ * @brief Parse Knots to cm/s using pure integer math (1 Knot = 463/9000 m/s = 463/90 cm/s)
  */
-static void nmea_parse_gga(const char *sentence)
+static rt_uint8_t nmea_parse_knots_to_cm_s(const nmea_field_t *field, rt_uint32_t *speed_cm_s)
 {
-    char field[NMEA_FIELD_MAX_LEN];
-    const char *p = sentence;
+    rt_uint8_t seen_dot = 0U;
+    rt_uint8_t fraction_digits = 0U;
+    rt_uint32_t integer_part = 0U;
+    rt_uint32_t fraction_part = 0U;
+    rt_uint32_t knots_milli;
 
-    /* Field 0: Sentence ID ($xxGGA) */
-    p = nmea_next_field(p, field, sizeof(field));
-
-    /* Field 1: UTC Time (hhmmss.sss) */
-    p = nmea_next_field(p, field, sizeof(field));
-    if (field[0] != '\0')
+    if (!field || !speed_cm_s || (field->length == 0U))
     {
-        rt_uint32_t raw_time = (rt_uint32_t)strtoul(field, RT_NULL, 10);
-        rt_mutex_take(&_mutex_data, RT_WAITING_FOREVER);
-        _gnss_data.utc_time = raw_time;
-        rt_mutex_release(&_mutex_data);
+        return 0U;
     }
 
-    /* Field 2: Latitude (ddmm.mmmm) */
-    p = nmea_next_field(p, field, sizeof(field));
-    char lat_str[NMEA_FIELD_MAX_LEN];
-    rt_strncpy(lat_str, field, sizeof(lat_str));
+    for (rt_uint8_t i = 0U; i < field->length; i++)
+    {
+        char ch = field->ptr[i];
+        if (ch == '.')
+        {
+            if (seen_dot != 0U) return 0U;
+            seen_dot = 1U;
+            continue;
+        }
+        if ((ch < '0') || (ch > '9')) return 0U;
 
-    /* Field 3: N/S Direction */
-    p = nmea_next_field(p, field, sizeof(field));
-    char lat_dir = field[0];
+        if (seen_dot == 0U)
+        {
+            rt_uint32_t digit = (rt_uint32_t)(ch - '0');
+            if ((integer_part > 999U) || ((integer_part == 999U) && (digit > 9U))) return 0U;
+            integer_part = (integer_part * 10U) + digit;
+        }
+        else if (fraction_digits < 3U)
+        {
+            fraction_part = (fraction_part * 10U) + (rt_uint32_t)(ch - '0');
+            fraction_digits++;
+        }
+    }
 
-    /* Field 4: Longitude (dddmm.mmmm) */
-    p = nmea_next_field(p, field, sizeof(field));
-    char lon_str[NMEA_FIELD_MAX_LEN];
-    rt_strncpy(lon_str, field, sizeof(lon_str));
+    while (fraction_digits < 3U)
+    {
+        fraction_part *= 10U;
+        fraction_digits++;
+    }
 
-    /* Field 5: E/W Direction */
-    p = nmea_next_field(p, field, sizeof(field));
-    char lon_dir = field[0];
+    if (integer_part > 9999U) return 0U;
 
-    /* Field 6: Fix Quality (0=Invalid, 1=SPS, 2=DGPS, etc.) */
-    p = nmea_next_field(p, field, sizeof(field));
-    rt_uint8_t fix_quality = (rt_uint8_t)atoi(field);
+    knots_milli = (integer_part * 1000U) + fraction_part;
+    /* (knots_milli / 1000) * 1.852 * 100000 / 3600 = knots_milli * 463 / 9000 */
+    *speed_cm_s = ((knots_milli / 9000U) * 463U) +
+                  ((((knots_milli % 9000U) * 463U) + 4500U) / 9000U);
+    return 1U;
+}
 
-    /* Field 7: Satellites used */
-    p = nmea_next_field(p, field, sizeof(field));
-    rt_uint8_t sats = (rt_uint8_t)atoi(field);
+/**
+ * @brief Safe float parser for altitude, course, and HDOP
+ */
+static rt_uint8_t nmea_parse_float(const nmea_field_t *field, float *val)
+{
+    char tmp[16];
+    if (!field || !val || field->length == 0U || field->length >= sizeof(tmp))
+    {
+        return 0U;
+    }
+    rt_memcpy(tmp, field->ptr, field->length);
+    tmp[field->length] = '\0';
+    *val = (float)atof(tmp);
+    return 1U;
+}
 
-    /* Field 8: HDOP */
-    p = nmea_next_field(p, field, sizeof(field));
-    float hdop = (float)atof(field);
+static rt_uint8_t nmea_sentence_matches(const nmea_field_t *field, char a, char b, char c)
+{
+    if (!field || (field->length != 5U))
+    {
+        return 0U;
+    }
+    return ((field->ptr[2] == a) && (field->ptr[3] == b) && (field->ptr[4] == c)) ? 1U : 0U;
+}
 
-    /* Field 9: Altitude */
-    p = nmea_next_field(p, field, sizeof(field));
-    float alt = (float)atof(field);
+/**
+ * @brief Zero-copy field splitter handling empty fields ",," correctly
+ */
+static rt_uint8_t nmea_split_fields(const char *sentence,
+                                    rt_uint16_t body_start,
+                                    rt_uint16_t body_end,
+                                    nmea_field_t *fields,
+                                    rt_uint8_t *field_count)
+{
+    rt_uint16_t start = body_start;
+    rt_uint8_t count = 0U;
+
+    for (rt_uint16_t i = body_start; i <= body_end; i++)
+    {
+        if ((i == body_end) || (sentence[i] == ','))
+        {
+            if (count >= NMEA_MAX_FIELDS) return 0U;
+            fields[count].ptr = &sentence[start];
+            fields[count].length = (rt_uint8_t)(i - start);
+            count++;
+            start = (rt_uint16_t)(i + 1U);
+        }
+    }
+
+    *field_count = count;
+    return (count > 0U) ? 1U : 0U;
+}
+
+/**
+ * @brief Parse RMC sentence into decoded components
+ */
+static nmea_res_t nmea_parse_rmc(const nmea_field_t *fields, rt_uint8_t field_count)
+{
+    rt_uint8_t hour, minute, second;
+    rt_uint16_t year;
+    rt_uint8_t month, day;
+    rt_int32_t lat_e7, lon_e7;
+    rt_uint32_t speed_cm_s = 0U;
+    float course = 0.0f;
+    rt_bool_t valid;
+
+    if (field_count < 10U)
+    {
+        return NMEA_RES_FORMAT_ERROR;
+    }
+
+    if (nmea_parse_time(&fields[1], &hour, &minute, &second) == 0U)
+    {
+        return NMEA_RES_FORMAT_ERROR;
+    }
+
+    if ((fields[2].length != 1U) || ((fields[2].ptr[0] != 'A') && (fields[2].ptr[0] != 'V')))
+    {
+        return NMEA_RES_FORMAT_ERROR;
+    }
+    valid = (fields[2].ptr[0] == 'A') ? RT_TRUE : RT_FALSE;
+
+    if (valid)
+    {
+        if ((fields[4].length != 1U) || (fields[6].length != 1U) ||
+            (nmea_parse_coordinate(&fields[3], fields[4].ptr[0], 2U, &lat_e7) == 0U) ||
+            (nmea_parse_coordinate(&fields[5], fields[6].ptr[0], 3U, &lon_e7) == 0U))
+        {
+            return NMEA_RES_FORMAT_ERROR;
+        }
+    }
+
+    if (fields[7].length > 0U)
+    {
+        nmea_parse_knots_to_cm_s(&fields[7], &speed_cm_s);
+    }
+    if (fields[8].length > 0U)
+    {
+        nmea_parse_float(&fields[8], &course);
+    }
+
+    if (nmea_parse_date(&fields[9], &year, &month, &day) == 0U)
+    {
+        return NMEA_RES_FORMAT_ERROR;
+    }
 
     /* Update shared data under mutex */
     rt_mutex_take(&_mutex_data, RT_WAITING_FOREVER);
-    _gnss_data.fix_quality = fix_quality;
-    _gnss_data.is_fixed    = (fix_quality > 0) ? RT_TRUE : RT_FALSE;
-    _gnss_data.sats_used   = sats;
-    _gnss_data.hdop        = hdop;
-    _gnss_data.altitude    = alt;
+    _gnss_data.hour   = hour;
+    _gnss_data.minute = minute;
+    _gnss_data.second = second;
+    _gnss_data.utc_time = ((rt_uint32_t)hour * 10000) + ((rt_uint32_t)minute * 100) + second;
 
-    if (lat_str[0] != '\0' && (lat_dir == 'N' || lat_dir == 'S'))
-    {
-        double lat = nmea_coord_to_deg(lat_str);
-        if (lat_dir == 'S') lat = -lat;
-        _gnss_data.latitude = lat;
-        _gnss_data.lat_dir  = lat_dir;
-    }
+    _gnss_data.year   = year;
+    _gnss_data.month  = month;
+    _gnss_data.day    = day;
+    _gnss_data.utc_date = ((rt_uint32_t)day * 10000) + ((rt_uint32_t)month * 100) + (year % 100);
 
-    if (lon_str[0] != '\0' && (lon_dir == 'E' || lon_dir == 'W'))
-    {
-        double lon = nmea_coord_to_deg(lon_str);
-        if (lon_dir == 'W') lon = -lon;
-        _gnss_data.longitude = lon;
-        _gnss_data.lon_dir   = lon_dir;
-    }
-
-    if (_gnss_data.is_fixed)
-    {
-        _gnss_data.last_update_tick = rt_tick_get();
-    }
-    rt_mutex_release(&_mutex_data);
-
-    _stat_gga_count++;
-}
-
-/**
- * @brief Parse RMC sentence ($GNRMC, $GPRMC, $BDRMC)
- * Format: $xxRMC,time,status,lat,lat_dir,lon,lon_dir,speed,course,date,mag_var,mag_dir,mode*cs
- */
-static void nmea_parse_rmc(const char *sentence)
-{
-    char field[NMEA_FIELD_MAX_LEN];
-    const char *p = sentence;
-
-    /* Field 0: Sentence ID ($xxRMC) */
-    p = nmea_next_field(p, field, sizeof(field));
-
-    /* Field 1: UTC Time (hhmmss.sss) */
-    p = nmea_next_field(p, field, sizeof(field));
-    rt_uint32_t utc_time = 0;
-    if (field[0] != '\0')
-    {
-        utc_time = (rt_uint32_t)strtoul(field, RT_NULL, 10);
-    }
-
-    /* Field 2: Status ('A'=Valid, 'V'=Warning) */
-    p = nmea_next_field(p, field, sizeof(field));
-    rt_bool_t is_valid = (field[0] == 'A') ? RT_TRUE : RT_FALSE;
-
-    /* Field 3: Latitude */
-    p = nmea_next_field(p, field, sizeof(field));
-    char lat_str[NMEA_FIELD_MAX_LEN];
-    rt_strncpy(lat_str, field, sizeof(lat_str));
-
-    /* Field 4: N/S */
-    p = nmea_next_field(p, field, sizeof(field));
-    char lat_dir = field[0];
-
-    /* Field 5: Longitude */
-    p = nmea_next_field(p, field, sizeof(field));
-    char lon_str[NMEA_FIELD_MAX_LEN];
-    rt_strncpy(lon_str, field, sizeof(lon_str));
-
-    /* Field 6: E/W */
-    p = nmea_next_field(p, field, sizeof(field));
-    char lon_dir = field[0];
-
-    /* Field 7: Speed over ground in knots */
-    p = nmea_next_field(p, field, sizeof(field));
-    float speed_kmh = (float)(atof(field) * 1.852); /* 1 knot = 1.852 km/h */
-
-    /* Field 8: Course over ground in degrees */
-    p = nmea_next_field(p, field, sizeof(field));
-    float course = (float)atof(field);
-
-    /* Field 9: UTC Date (ddmmyy) */
-    p = nmea_next_field(p, field, sizeof(field));
-    rt_uint32_t utc_date = 0;
-    if (field[0] != '\0')
-    {
-        utc_date = (rt_uint32_t)strtoul(field, RT_NULL, 10);
-    }
-
-    /* Update shared data under mutex */
-    rt_mutex_take(&_mutex_data, RT_WAITING_FOREVER);
-    _gnss_data.is_fixed   = is_valid;
-    _gnss_data.speed_kmh  = speed_kmh;
+    _gnss_data.is_fixed   = valid;
+    _gnss_data.speed_cm_s = speed_cm_s;
+    _gnss_data.speed_kmh  = (float)speed_cm_s * 0.036f;
     _gnss_data.course     = course;
 
-    if (utc_time > 0)
+    if (valid)
     {
-        _gnss_data.utc_time = utc_time;
-    }
-    if (utc_date > 0)
-    {
-        _gnss_data.utc_date = utc_date;
-    }
-
-    if (lat_str[0] != '\0' && (lat_dir == 'N' || lat_dir == 'S'))
-    {
-        double lat = nmea_coord_to_deg(lat_str);
-        if (lat_dir == 'S') lat = -lat;
-        _gnss_data.latitude = lat;
-        _gnss_data.lat_dir  = lat_dir;
-    }
-
-    if (lon_str[0] != '\0' && (lon_dir == 'E' || lon_dir == 'W'))
-    {
-        double lon = nmea_coord_to_deg(lon_str);
-        if (lon_dir == 'W') lon = -lon;
-        _gnss_data.longitude = lon;
-        _gnss_data.lon_dir   = lon_dir;
-    }
-
-    if (is_valid)
-    {
+        _gnss_data.latitude_e7  = lat_e7;
+        _gnss_data.longitude_e7 = lon_e7;
+        _gnss_data.lat_dir      = fields[4].ptr[0];
+        _gnss_data.lon_dir      = fields[6].ptr[0];
+        _gnss_data.latitude     = (double)lat_e7 / 10000000.0;
+        _gnss_data.longitude    = (double)lon_e7 / 10000000.0;
         _gnss_data.last_update_tick = rt_tick_get();
     }
     rt_mutex_release(&_mutex_data);
 
-    _stat_rmc_count++;
+    return NMEA_RES_OK_RMC;
 }
 
 /**
- * @brief Dispatch a complete NMEA sentence to appropriate parsers
+ * @brief Parse GGA sentence into decoded components
  */
-static void nmea_process_sentence(const char *sentence)
+static nmea_res_t nmea_parse_gga(const nmea_field_t *fields, rt_uint8_t field_count)
 {
-    _stat_sentences++;
+    rt_uint8_t hour, minute, second;
+    rt_uint32_t fix_quality;
+    rt_uint32_t satellites;
+    rt_int32_t lat_e7, lon_e7;
+    float hdop = 0.0f;
+    float alt = 0.0f;
 
-    /* Check checksum first */
-    if (!nmea_verify_checksum(sentence))
+    if (field_count < 10U)
     {
-        _stat_crc_err++;
+        return NMEA_RES_FORMAT_ERROR;
+    }
+
+    if (nmea_parse_time(&fields[1], &hour, &minute, &second) == 0U)
+    {
+        return NMEA_RES_FORMAT_ERROR;
+    }
+
+    if ((nmea_parse_uint(&fields[6], &fix_quality) == 0U) || (fix_quality > 255U))
+    {
+        return NMEA_RES_FORMAT_ERROR;
+    }
+
+    if ((nmea_parse_uint(&fields[7], &satellites) == 0U) || (satellites > 255U))
+    {
+        return NMEA_RES_FORMAT_ERROR;
+    }
+
+    if (fields[8].length > 0U)
+    {
+        nmea_parse_float(&fields[8], &hdop);
+    }
+    if (fields[9].length > 0U)
+    {
+        nmea_parse_float(&fields[9], &alt);
+    }
+
+    if (fix_quality > 0U)
+    {
+        if ((fields[3].length != 1U) || (fields[5].length != 1U) ||
+            (nmea_parse_coordinate(&fields[2], fields[3].ptr[0], 2U, &lat_e7) == 0U) ||
+            (nmea_parse_coordinate(&fields[4], fields[5].ptr[0], 3U, &lon_e7) == 0U))
+        {
+            return NMEA_RES_FORMAT_ERROR;
+        }
+    }
+
+    /* Update shared data under mutex */
+    rt_mutex_take(&_mutex_data, RT_WAITING_FOREVER);
+    _gnss_data.hour        = hour;
+    _gnss_data.minute      = minute;
+    _gnss_data.second      = second;
+    _gnss_data.utc_time    = ((rt_uint32_t)hour * 10000) + ((rt_uint32_t)minute * 100) + second;
+
+    _gnss_data.fix_quality = (rt_uint8_t)fix_quality;
+    _gnss_data.sats_used   = (rt_uint8_t)satellites;
+    _gnss_data.hdop        = hdop;
+    _gnss_data.altitude    = alt;
+    _gnss_data.is_fixed    = (fix_quality > 0U) ? RT_TRUE : RT_FALSE;
+
+    if (fix_quality > 0U)
+    {
+        _gnss_data.latitude_e7  = lat_e7;
+        _gnss_data.longitude_e7 = lon_e7;
+        _gnss_data.lat_dir      = fields[3].ptr[0];
+        _gnss_data.lon_dir      = fields[5].ptr[0];
+        _gnss_data.latitude     = (double)lat_e7 / 10000000.0;
+        _gnss_data.longitude    = (double)lon_e7 / 10000000.0;
+        _gnss_data.last_update_tick = rt_tick_get();
+    }
+    rt_mutex_release(&_mutex_data);
+
+    return NMEA_RES_OK_GGA;
+}
+
+/**
+ * @brief Dispatch complete line to NMEA parser with checksum and split verification
+ */
+static void nmea_process_sentence(const char *sentence, rt_uint16_t length)
+{
+    nmea_field_t fields[NMEA_MAX_FIELDS];
+    rt_uint16_t star_idx = length;
+    rt_uint8_t field_cnt;
+    rt_uint8_t calc_crc = 0U;
+    rt_uint8_t high, low;
+
+    _gnss_stats.sentences++;
+
+    if (!sentence || (length < 7U) || (sentence[0] != '$'))
+    {
+        _gnss_stats.format_error++;
+        return;
+    }
+
+    /* Locate '*' checksum separator */
+    for (rt_uint16_t i = 1U; i < length; i++)
+    {
+        if (sentence[i] == '*')
+        {
+            star_idx = i;
+            break;
+        }
+    }
+
+    if ((star_idx == length) || (star_idx < 2U) || ((rt_uint16_t)(star_idx + 3U) != length))
+    {
+        _gnss_stats.format_error++;
+        return;
+    }
+
+    /* XOR Checksum verification */
+    for (rt_uint16_t i = 1U; i < star_idx; i++)
+    {
+        calc_crc ^= (rt_uint8_t)sentence[i];
+    }
+
+    if ((nmea_hex_val(sentence[star_idx + 1U], &high) == 0U) ||
+        (nmea_hex_val(sentence[star_idx + 2U], &low) == 0U))
+    {
+        _gnss_stats.format_error++;
+        return;
+    }
+
+    if (calc_crc != (rt_uint8_t)((high << 4) | low))
+    {
+        _gnss_stats.checksum_error++;
         return;
     }
 
@@ -362,82 +626,103 @@ static void nmea_process_sentence(const char *sentence)
         _sentence_handler(sentence);
     }
 
-    /* Identify sentence type: 3rd through 5th chars, e.g. GGA, RMC */
-    if (rt_strstr(sentence, "GGA,"))
+    /* Split body fields between '$' and '*' */
+    if (nmea_split_fields(sentence, 1U, star_idx, fields, &field_cnt) == 0U)
     {
-        nmea_parse_gga(sentence);
+        _gnss_stats.format_error++;
+        return;
     }
-    else if (rt_strstr(sentence, "RMC,"))
+
+    if (nmea_sentence_matches(&fields[0], 'R', 'M', 'C') != 0U)
     {
-        nmea_parse_rmc(sentence);
+        nmea_res_t res = nmea_parse_rmc(fields, field_cnt);
+        if (res == NMEA_RES_OK_RMC) _gnss_stats.rmc_ok++;
+        else _gnss_stats.format_error++;
+    }
+    else if (nmea_sentence_matches(&fields[0], 'G', 'G', 'A') != 0U)
+    {
+        nmea_res_t res = nmea_parse_gga(fields, field_cnt);
+        if (res == NMEA_RES_OK_GGA) _gnss_stats.gga_ok++;
+        else _gnss_stats.format_error++;
+    }
+    else
+    {
+        _gnss_stats.unsupported++;
     }
 }
 
-/**
- * @brief UART RX callback indicating incoming data
- */
+/* ------------------- RT-Thread Device Interface & Threads ------------------- */
+
 static rt_err_t gnss_uart_rx_ind(rt_device_t dev, rt_size_t size)
 {
     rt_sem_release(&_sem_rx);
     return RT_EOK;
 }
 
-/**
- * @brief GNSS receiver and parser thread
- */
 static void gnss_rx_thread_entry(void *parameter)
 {
     char line_buf[GNSS_NMEA_LINE_MAX_SZ];
-    rt_size_t line_idx = 0;
-    rt_uint8_t ch = 0;
+    rt_uint16_t line_len = 0U;
+    rt_uint8_t collecting = 0U;
+    rt_uint8_t ch = 0U;
 
-    LOG_I("GNSS parser thread running...");
+    LOG_I("GNSS parser thread (high-robustness engine) running...");
 
     while (1)
     {
-        /* Wait for incoming UART data */
         while (rt_device_read(_gnss_dev, 0, &ch, 1) == 1)
         {
-            _stat_rx_bytes++;
+            _gnss_stats.bytes++;
 
-            if (ch == '$')
+            if (ch == (rt_uint8_t)'$')
             {
-                /* Start of new NMEA sentence */
-                line_idx = 0;
-                line_buf[line_idx++] = '$';
+                if ((collecting != 0U) && (line_len > 0U))
+                {
+                    _gnss_stats.format_error++;
+                }
+                collecting = 1U;
+                line_len = 0U;
+                line_buf[line_len++] = '$';
+                continue;
             }
-            else if (line_idx > 0)
+
+            if (collecting == 0U)
             {
-                if (ch == '\r' || ch == '\n')
-                {
-                    /* End of sentence */
-                    if (line_idx > 4) /* Minimum valid sentence like $xx*hh */
-                    {
-                        line_buf[line_idx] = '\0';
-                        nmea_process_sentence(line_buf);
-                    }
-                    line_idx = 0;
-                }
-                else if (line_idx < sizeof(line_buf) - 1)
-                {
-                    line_buf[line_idx++] = (char)ch;
-                }
-                else
-                {
-                    /* Buffer overflow protection: discard corrupted long line */
-                    line_idx = 0;
-                }
+                continue;
             }
+
+            if (ch == (rt_uint8_t)'\n')
+            {
+                rt_uint16_t parse_len = line_len;
+                if ((parse_len > 0U) && (line_buf[parse_len - 1U] == '\r'))
+                {
+                    parse_len--;
+                }
+                if (parse_len > 0U)
+                {
+                    line_buf[parse_len] = '\0';
+                    nmea_process_sentence(line_buf, parse_len);
+                }
+                line_len = 0U;
+                collecting = 0U;
+                continue;
+            }
+
+            if (line_len >= (GNSS_NMEA_LINE_MAX_SZ - 1U))
+            {
+                _gnss_stats.overflow_error++;
+                line_len = 0U;
+                collecting = 0U;
+                continue;
+            }
+
+            line_buf[line_len++] = (char)ch;
         }
 
-        /* Block waiting for next RX interrupt */
         rt_sem_take(&_sem_rx, RT_WAITING_FOREVER);
     }
 }
 
-/**
- * @brief Initialize GNSS module interface on uart2
- */
 int gnss_init(void)
 {
     struct serial_configure cfg = RT_SERIAL_CONFIG_DEFAULT;
@@ -483,6 +768,7 @@ int gnss_init(void)
 
     /* 6. Initialize synchronization & data */
     rt_memset(&_gnss_data, 0, sizeof(_gnss_data));
+    rt_memset(&_gnss_stats, 0, sizeof(_gnss_stats));
     rt_sem_init(&_sem_rx, "sgnss_rx", 0, RT_IPC_FLAG_PRIO);
     rt_mutex_init(&_mutex_data, "mgnss_dt", RT_IPC_FLAG_PRIO);
 
@@ -504,7 +790,7 @@ int gnss_init(void)
     rt_thread_startup(_rx_thread);
 
     _inited = RT_TRUE;
-    LOG_I("GNSS module ready: %s @ 115200 8N1", GNSS_UART_NAME);
+    LOG_I("GNSS module ready: %s @ 115200 8N1 with Fixed-point E7 Engine", GNSS_UART_NAME);
 
     return RT_EOK;
 }
@@ -525,6 +811,36 @@ rt_bool_t gnss_get_data(gnss_data_t *out_data)
     rt_mutex_release(&_mutex_data);
 
     return fixed;
+}
+
+rt_bool_t gnss_is_fresh(rt_uint32_t timeout_ms)
+{
+    rt_bool_t fresh = RT_FALSE;
+
+    rt_mutex_take(&_mutex_data, RT_WAITING_FOREVER);
+    if (_gnss_data.is_fixed)
+    {
+        rt_tick_t elapsed_ticks = rt_tick_get() - _gnss_data.last_update_tick;
+        rt_uint32_t elapsed_ms = (rt_uint32_t)(elapsed_ticks * (1000 / RT_TICK_PER_SECOND));
+        if (elapsed_ms <= timeout_ms)
+        {
+            fresh = RT_TRUE;
+        }
+    }
+    rt_mutex_release(&_mutex_data);
+
+    return fresh;
+}
+
+void gnss_get_stats(gnss_stats_t *out_stats)
+{
+    if (!out_stats)
+    {
+        return;
+    }
+    rt_mutex_take(&_mutex_data, RT_WAITING_FOREVER);
+    rt_memcpy(out_stats, &_gnss_stats, sizeof(gnss_stats_t));
+    rt_mutex_release(&_mutex_data);
 }
 
 rt_size_t gnss_send_cmd(const char *cmd)
@@ -585,11 +901,15 @@ void gnss_set_sentence_handler(gnss_sentence_handler_t handler)
 static int gnss_status(int argc, char **argv)
 {
     gnss_data_t data;
+    gnss_stats_t stats;
     rt_bool_t fixed = gnss_get_data(&data);
+    gnss_get_stats(&stats);
+    rt_bool_t fresh = gnss_is_fresh(10000); /* 10s freshness threshold */
 
     rt_kprintf("\r\n================ GNSS Status ================\r\n");
     rt_kprintf(" Port           : %s (PA3-RX, PA4-TX)\r\n", GNSS_UART_NAME);
     rt_kprintf(" Fix Status     : %s\r\n", fixed ? "FIXED (VALID)" : "NO FIX (INVALID)");
+    rt_kprintf(" Freshness      : %s (Threshold: 10s)\r\n", fresh ? "FRESH" : "STALE / EXPIRED");
     rt_kprintf(" Fix Quality    : %d (%s)\r\n", data.fix_quality,
                (data.fix_quality == 1) ? "GPS SPS" :
                (data.fix_quality == 2) ? "DGPS" :
@@ -598,23 +918,19 @@ static int gnss_status(int argc, char **argv)
     rt_kprintf(" Satellites     : %d in use\r\n", data.sats_used);
     rt_kprintf(" HDOP           : %d.%02d\r\n", (int)data.hdop, (int)(data.hdop * 100) % 100);
     rt_kprintf(" Altitude       : %d.%01d m\r\n", (int)data.altitude, (int)(data.altitude * 10) % 10);
-    rt_kprintf(" Speed          : %d.%02d km/h\r\n", (int)data.speed_kmh, (int)(data.speed_kmh * 100) % 100);
+    rt_kprintf(" Speed          : %u cm/s (%d.%02d km/h)\r\n",
+               data.speed_cm_s, (int)data.speed_kmh, (int)(data.speed_kmh * 100) % 100);
     rt_kprintf(" Course         : %d.%01d deg\r\n", (int)data.course, (int)(data.course * 10) % 10);
 
-    /* Latitude & Longitude with 6 decimal places */
-    int lat_deg = (int)data.latitude;
-    int lat_frac = (int)((data.latitude > 0 ? data.latitude - lat_deg : lat_deg - data.latitude) * 1000000.0);
-    int lon_deg = (int)data.longitude;
-    int lon_frac = (int)((data.longitude > 0 ? data.longitude - lon_deg : lon_deg - data.longitude) * 1000000.0);
-
-    rt_kprintf(" Latitude       : %d.%06d deg %c\r\n", lat_deg, lat_frac, data.lat_dir ? data.lat_dir : '-');
-    rt_kprintf(" Longitude      : %d.%06d deg %c\r\n", lon_deg, lon_frac, data.lon_dir ? data.lon_dir : '-');
+    /* High Precision E7 vs Formatted */
+    rt_kprintf(" Lat (E7)       : %d (%.7f deg %c)\r\n",
+               data.latitude_e7, data.latitude, data.lat_dir ? data.lat_dir : '-');
+    rt_kprintf(" Lon (E7)       : %d (%.7f deg %c)\r\n",
+               data.longitude_e7, data.longitude, data.lon_dir ? data.lon_dir : '-');
 
     /* UTC Date & Time */
-    rt_uint32_t t = data.utc_time;
-    rt_uint32_t d = data.utc_date;
-    rt_kprintf(" UTC Time       : %02d:%02d:%02d\r\n", (int)(t / 10000), (int)((t % 10000) / 100), (int)(t % 100));
-    rt_kprintf(" UTC Date       : 20%02d-%02d-%02d\r\n", (int)(d % 100), (int)((d % 10000) / 100), (int)(d / 10000));
+    rt_kprintf(" UTC Time       : %02d:%02d:%02d\r\n", data.hour, data.minute, data.second);
+    rt_kprintf(" UTC Date       : %04d-%02d-%02d\r\n", data.year, data.month, data.day);
 
     if (fixed)
     {
@@ -623,11 +939,14 @@ static int gnss_status(int argc, char **argv)
     }
 
     rt_kprintf("---------------- Statistics -----------------\r\n");
-    rt_kprintf(" RX Total Bytes : %u\r\n", _stat_rx_bytes);
-    rt_kprintf(" NMEA Sentences : %u\r\n", _stat_sentences);
-    rt_kprintf(" Checksum Errors: %u\r\n", _stat_crc_err);
-    rt_kprintf(" GGA Sentences  : %u\r\n", _stat_gga_count);
-    rt_kprintf(" RMC Sentences  : %u\r\n", _stat_rmc_count);
+    rt_kprintf(" RX Total Bytes : %u\r\n", stats.bytes);
+    rt_kprintf(" Sentences Total: %u\r\n", stats.sentences);
+    rt_kprintf(" RMC OK         : %u\r\n", stats.rmc_ok);
+    rt_kprintf(" GGA OK         : %u\r\n", stats.gga_ok);
+    rt_kprintf(" Checksum Errors: %u\r\n", stats.checksum_error);
+    rt_kprintf(" Format Errors  : %u\r\n", stats.format_error);
+    rt_kprintf(" Overflow Errors: %u\r\n", stats.overflow_error);
+    rt_kprintf(" Unsupported    : %u\r\n", stats.unsupported);
     rt_kprintf(" Raw Log Stream : %s\r\n", _raw_log ? "ON" : "OFF");
     rt_kprintf("=============================================\r\n\r\n");
 
