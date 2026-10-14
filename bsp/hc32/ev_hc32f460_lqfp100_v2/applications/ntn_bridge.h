@@ -6,31 +6,23 @@
  * Change Logs:
  * Date           Author       Notes
  * 2026-10-13     Antigravity  First version: PC <-> MCU <-> NTN transparent bridge
+ * 2026-10-14     Stephen      Redirect to enhanced MS150 NTN driver (ntn_ms150.h)
  */
 
 #ifndef __NTN_BRIDGE_H__
 #define __NTN_BRIDGE_H__
 
-#include <rtthread.h>
-#include <rtdevice.h>
-#include "board_config.h"
+#include "ntn_ms150.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Device names */
-#define NTN_PC_UART_NAME        "uart1"     /* PC RS232: PA0(RX), PA1(TX) */
-#define NTN_MODEM_UART_NAME     "uart3"     /* NTN ST1000: PB4(TX), PB5(RX) */
-
-/* Hardware control API */
-void ntn_hw_init(void);
-void ntn_power_control(rt_bool_t on);
-void ntn_reset(void);
-int ntn_get_status_pin(void);
-
-/* Bridge API */
-int ntn_bridge_init(void);
+/* Backward compatibility aliases */
+static inline void ntn_hw_init(void)          { ntn_ms150_init(); }
+static inline void ntn_power_control(rt_bool_t on) { ntn_power_set(on); }
+static inline int  ntn_get_status_pin(void)   { return hw_ntn_status_get(); }
+static inline int  ntn_bridge_init(void)      { return ntn_ms150_init(); }
 
 #ifdef __cplusplus
 }
