@@ -138,6 +138,13 @@
 /* DFS: device virtual file system */
 
 /* end of DFS: device virtual file system */
+#define RT_USING_FAL
+#define FAL_USING_DEBUG
+#define FAL_PART_HAS_TABLE_CFG
+#define FAL_USING_SFUD_PORT
+#define FAL_USING_NOR_FLASH_DEV_NAME "norflash0"
+#define FAL_DEV_NAME_MAX 24
+#define FAL_DEV_BLK_MAX 6
 
 /* Device Drivers */
 
@@ -152,6 +159,15 @@
 #define RT_SERIAL_RB_BUFSZ 512
 #define RT_USING_I2C
 #define RT_USING_I2C_BITOPS
+#define RT_USING_SPI
+#define RT_USING_SPI_ISR
+#define RT_USING_QSPI
+#define RT_USING_SFUD
+#define RT_SFUD_USING_SFDP
+#define RT_SFUD_USING_FLASH_INFO_TABLE
+#define RT_SFUD_USING_QSPI
+#define RT_SFUD_SPI_MAX_HZ 50000000
+#define RT_USING_WDT
 #define RT_USING_PIN
 /* end of Device Drivers */
 
@@ -227,6 +243,11 @@
 #define BSP_USING_I2C
 #define BSP_USING_I2C_HW
 #define BSP_USING_I2C3
+#define BSP_USING_ON_CHIP_FLASH
+#define BSP_USING_WDT_TMR
+#define BSP_USING_WDT
+#define BSP_USING_QSPI
+#define BSP_QSPI_USING_SOFT_CS
 /* end of On-chip Peripheral Drivers */
 
 /* Board extended module Drivers */

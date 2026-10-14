@@ -10,6 +10,7 @@
 
 #include "pc_rs232.h"
 #include <stdlib.h>
+#include "task_wdt.h"
 
 #define DBG_TAG "pc.rs232"
 #define DBG_LVL DBG_INFO
@@ -56,11 +57,13 @@ static void rs232_rx_thread_entry(void *parameter)
 
     while (1)
     {
-        /* Block until the first byte of a new frame arrives */
-        if (rt_sem_take(&_sem_rx, RT_WAITING_FOREVER) != RT_EOK)
+        /* Block until the first byte of a new frame arrives or 5s heartbeat timeout */
+        if (rt_sem_take(&_sem_rx, rt_tick_from_millisecond(5000)) != RT_EOK)
         {
+            task_wdt_heartbeat_by_name("rs232");
             continue;
         }
+        task_wdt_heartbeat_by_name("rs232");
 
         rt_size_t frame_len = 0;
 

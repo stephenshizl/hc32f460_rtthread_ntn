@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "task_wdt.h"
 
 #define DBG_TAG "gnss"
 #define DBG_LVL DBG_INFO
@@ -719,7 +720,8 @@ static void gnss_rx_thread_entry(void *parameter)
             line_buf[line_len++] = (char)ch;
         }
 
-        rt_sem_take(&_sem_rx, RT_WAITING_FOREVER);
+        rt_sem_take(&_sem_rx, rt_tick_from_millisecond(5000));
+        task_wdt_heartbeat_by_name("gnss");
     }
 }
 

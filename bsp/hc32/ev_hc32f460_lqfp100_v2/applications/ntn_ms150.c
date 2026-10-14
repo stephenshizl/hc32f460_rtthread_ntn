@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "task_wdt.h"
 
 #define DBG_TAG "ntn.ms150"
 #define DBG_LVL DBG_INFO
@@ -102,7 +103,8 @@ static void ntn_rx_thread_entry(void *parameter)
             }
         }
 
-        rt_sem_take(&_sem_rx, RT_WAITING_FOREVER);
+        rt_sem_take(&_sem_rx, rt_tick_from_millisecond(5000));
+        task_wdt_heartbeat_by_name("ntn");
     }
 }
 

@@ -11,6 +11,7 @@
 #include "ble_uart.h"
 #include "hw_power.h"
 #include <stdlib.h>
+#include "task_wdt.h"
 
 #define DBG_TAG "ble.uart"
 #define DBG_LVL DBG_INFO
@@ -140,11 +141,13 @@ static void ble_rx_thread_entry(void *parameter)
 
     while (1)
     {
-        /* Wait for first incoming byte */
-        if (rt_sem_take(&_sem_rx, RT_WAITING_FOREVER) != RT_EOK)
+        /* Wait for first incoming byte or 5s heartbeat timeout */
+        if (rt_sem_take(&_sem_rx, rt_tick_from_millisecond(5000)) != RT_EOK)
         {
+            task_wdt_heartbeat_by_name("ble");
             continue;
         }
+        task_wdt_heartbeat_by_name("ble");
 
         rt_size_t frame_len = 0;
 
