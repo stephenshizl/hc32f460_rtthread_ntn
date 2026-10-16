@@ -279,6 +279,11 @@ static void ctrl2_ntn_worker(void *parameter)
         s_ntn_request_active = RT_TRUE;
         result = ntn_debug_exec_cmd(s_ntn_cmd, response, sizeof(response), 60000U);
         s_ntn_request_active = RT_FALSE;
+        /* A completed Bluetooth debug transaction must immediately return
+         * UART3 ownership to the automatic NTN service.  Waiting for the
+         * 60-second lease deadline would stall normal uplink after every
+         * successful short AT command. */
+        ntn_debug_lock_release();
         rt_snprintf(final, sizeof(final), "{\"ok\":%s,\"error\":%u}",
                     result == RT_EOK ? "true" : "false",
                     result == RT_EOK ? 0U :
