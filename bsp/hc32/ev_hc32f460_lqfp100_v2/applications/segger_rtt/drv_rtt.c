@@ -10,6 +10,7 @@
 
 #include <rtthread.h>
 #include <rtdevice.h>
+#include <board.h>
 #include "SEGGER_RTT.h"
 
 #if defined(RT_USING_FINSH)
@@ -192,6 +193,8 @@ static void rtt_rx_timer_callback(void *parameter)
  */
 int rt_hw_rtt_init(void)
 {
+    rt_err_t result;
+
     if (_rtt_inited)
     {
         return RT_EOK;
@@ -219,7 +222,11 @@ int rt_hw_rtt_init(void)
 
     _rtt_dev.user_data   = RT_NULL;
 
-    rt_device_register(&_rtt_dev, "segger", RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_STREAM);
+    result = rt_device_register(&_rtt_dev, "segger", RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_STREAM);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
 
     /* Switch console device to SEGGER RTT */
     rt_console_set_device("segger");
@@ -234,6 +241,8 @@ INIT_BOARD_EXPORT(rt_hw_rtt_init);
  */
 int rt_hw_rtt_app_init(void)
 {
+    stc_clock_freq_t clock_freq;
+
 #if defined(RT_USING_FINSH)
     /* Switch FinSH shell device to SEGGER RTT */
     finsh_set_device("segger");
@@ -249,10 +258,15 @@ int rt_hw_rtt_app_init(void)
     rt_kprintf("\r\n");
     rt_kprintf("==============================================================\r\n");
     rt_kprintf("  Iridium NTN Smart Terminal - SEGGER RTT Console & Log Ready \r\n");
-    rt_kprintf("  MCU: Xiaohua HC32F460 (ARM Cortex-M4 @ 200MHz)              \r\n");
+    rt_kprintf("  MCU: Xiaohua HC32F460 (ARM Cortex-M4)                       \r\n");
     rt_kprintf("  Console Device: segger (Up: 2048B, Down: 128B)              \r\n");
     rt_kprintf("  Interactive Shell: FinSH MSH Enabled via SWD RTT            \r\n");
     rt_kprintf("==============================================================\r\n\r\n");
+
+    (void)CLK_GetClockFreq(&clock_freq);
+    rt_kprintf("[CLK] status=%d, HRC=%u Hz, HCLK=%u Hz, PCLK1=%u Hz, PCLK2=%u Hz\r\n",
+               board_clock_get_status(), HRC_VALUE, clock_freq.u32HclkFreq,
+               clock_freq.u32Pclk1Freq, clock_freq.u32Pclk2Freq);
 
     return RT_EOK;
 }
@@ -262,14 +276,35 @@ int SEGGER_RTT_vprintf(unsigned BufferIndex, const char * sFormat, va_list * pPa
 {
     char acBuffer[128];
     int r;
+    unsigned write_len;
 
     r = rt_vsnprintf(acBuffer, sizeof(acBuffer), sFormat, *pParamList);
     if (r > 0)
     {
-        SEGGER_RTT_Write(BufferIndex, acBuffer, (unsigned)r);
+        write_len = (r >= (int)sizeof(acBuffer)) ? (sizeof(acBuffer) - 1U) : (unsigned)r;
+        SEGGER_RTT_Write(BufferIndex, acBuffer, write_len);
     }
     return r;
 }
+
+#if defined(RT_USING_FINSH)
+static int clock_status(int argc, char **argv)
+{
+    stc_clock_freq_t clock_freq;
+
+    RT_UNUSED(argc);
+    RT_UNUSED(argv);
+    (void)CLK_GetClockFreq(&clock_freq);
+
+    rt_kprintf("clock_status=%d (0=HRC->MPLL 200MHz)\r\n", board_clock_get_status());
+    rt_kprintf("HRC=%u HCLK=%u PCLK0=%u PCLK1=%u PCLK2=%u PCLK3=%u PCLK4=%u\r\n",
+               HRC_VALUE, clock_freq.u32HclkFreq, clock_freq.u32Pclk0Freq,
+               clock_freq.u32Pclk1Freq, clock_freq.u32Pclk2Freq,
+               clock_freq.u32Pclk3Freq, clock_freq.u32Pclk4Freq);
+    return 0;
+}
+MSH_CMD_EXPORT(clock_status, show HRC PLL and peripheral bus clocks);
+#endif
 
 int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...)
 {

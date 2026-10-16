@@ -99,6 +99,7 @@
 #define RT_USING_HEAP
 /* end of Memory Management */
 #define RT_USING_DEVICE
+#define RT_USING_THREADSAFE_PRINTF
 #define RT_USING_CONSOLE
 #define RT_CONSOLEBUF_SIZE 256
 #define RT_CONSOLE_DEVICE_NAME "segger"
@@ -166,7 +167,7 @@
 #define RT_SFUD_USING_SFDP
 #define RT_SFUD_USING_FLASH_INFO_TABLE
 #define RT_SFUD_USING_QSPI
-#define RT_SFUD_SPI_MAX_HZ 50000000
+#define RT_SFUD_SPI_MAX_HZ 40000000
 #define RT_USING_WDT
 #define RT_USING_PIN
 /* end of Device Drivers */

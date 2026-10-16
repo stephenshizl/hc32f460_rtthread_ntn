@@ -14,23 +14,10 @@
 #include <board.h>
 
 #include "hw_power.h"
-#include "pc_rs232.h"
 
 int main(void)
 {
     rt_kprintf("\r\n[SYS] NTN System Main Thread Started...\r\n");
-
-    /* 1. Initialize hardware power rails and peripheral GPIOs */
-    hw_power_init();
-
-    /* 2. Initialize PC RS232 communication interface (uart1, 19200/8N1) */
-    pc_rs232_init();
-
-    /* Send boot banner to PC RS232 */
-    pc_rs232_send_str("\r\n======================================================\r\n");
-    pc_rs232_send_str("  Iridium NTN Smart Terminal - PC RS232 Port Ready    \r\n");
-    pc_rs232_send_str("  UART: uart1 (PA0-RX, PA1-TX) @ 19200 bps 8N1       \r\n");
-    pc_rs232_send_str("======================================================\r\n\r\n");
 
     while (1)
     {

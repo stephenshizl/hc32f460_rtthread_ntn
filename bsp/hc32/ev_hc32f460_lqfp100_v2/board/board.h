@@ -47,6 +47,20 @@ void PeripheralClock_Config(void);
 void SystemBase_Config(void);
 void SystemClock_Config(void);
 
+typedef enum
+{
+    BOARD_CLOCK_STATUS_PLL_200M = 0,
+    BOARD_CLOCK_STATUS_NOT_CONFIGURED = -1,
+    BOARD_CLOCK_STATUS_HRC_START_FAILED = -2,
+    BOARD_CLOCK_STATUS_HRC_FREQ_UNSUPPORTED = -3,
+    BOARD_CLOCK_STATUS_PLL_START_FAILED = -4,
+    BOARD_CLOCK_STATUS_POWER_MODE_FAILED = -5,
+    BOARD_CLOCK_STATUS_PLL_VERIFY_FAILED = -6
+} board_clock_status_t;
+
+board_clock_status_t board_clock_get_status(void);
+rt_bool_t board_usb_clock_is_ready(void);
+
 #ifdef __cplusplus
 }
 #endif

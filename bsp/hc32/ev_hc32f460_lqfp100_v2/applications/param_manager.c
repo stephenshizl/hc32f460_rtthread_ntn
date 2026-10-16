@@ -393,7 +393,7 @@ int param_manager_init(void)
     s_param_inited = RT_TRUE;
     return RT_EOK;
 }
-INIT_APP_EXPORT(param_manager_init);
+INIT_COMPONENT_EXPORT(param_manager_init);
 
 /* MSH Diagnostic Commands */
 static void param_dump(int argc, char **argv)

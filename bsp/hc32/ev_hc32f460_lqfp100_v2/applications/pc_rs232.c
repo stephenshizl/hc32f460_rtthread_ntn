@@ -181,7 +181,7 @@ int pc_rs232_init(void)
 
     return RT_EOK;
 }
-INIT_APP_EXPORT(pc_rs232_init);
+INIT_ENV_EXPORT(pc_rs232_init);
 
 /**
  * @brief Register upper-layer frame receive callback

@@ -303,7 +303,7 @@ int ntn_ms150_init(void)
 
     return RT_EOK;
 }
-INIT_APP_EXPORT(ntn_ms150_init);
+INIT_ENV_EXPORT(ntn_ms150_init);
 
 void ntn_power_set(rt_bool_t on)
 {

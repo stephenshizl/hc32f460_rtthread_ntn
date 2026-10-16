@@ -88,7 +88,8 @@ int app_flash_init(void)
     LOG_I("FAL partitions initialized successfully.");
     return RT_EOK;
 }
-INIT_APP_EXPORT(app_flash_init);
+/* QSPI bus is registered during board init; probe Flash before config consumers. */
+INIT_DEVICE_EXPORT(app_flash_init);
 
 /* MSH Diagnostics */
 static void flash_info(int argc, char **argv)

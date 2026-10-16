@@ -796,7 +796,7 @@ int gnss_init(void)
 
     return RT_EOK;
 }
-INIT_APP_EXPORT(gnss_init);
+INIT_ENV_EXPORT(gnss_init);
 
 rt_bool_t gnss_get_data(gnss_data_t *out_data)
 {

@@ -270,7 +270,8 @@ int task_wdt_init(void)
     LOG_I("Multi-Task Heartbeat Watchdog Framework initialized.");
     return RT_EOK;
 }
-INIT_APP_EXPORT(task_wdt_init);
+/* Initialize the registry before any service or business task registers itself. */
+INIT_COMPONENT_EXPORT(task_wdt_init);
 
 /* MSH Diagnostics */
 static void wdt_status(int argc, char **argv)

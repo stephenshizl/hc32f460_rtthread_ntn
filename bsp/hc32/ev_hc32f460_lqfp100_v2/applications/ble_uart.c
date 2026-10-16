@@ -347,7 +347,7 @@ int ble_uart_init(void)
 
     return RT_EOK;
 }
-INIT_APP_EXPORT(ble_uart_init);
+INIT_ENV_EXPORT(ble_uart_init);
 
 void ble_uart_set_rx_handler(ble_rx_handler_t handler)
 {

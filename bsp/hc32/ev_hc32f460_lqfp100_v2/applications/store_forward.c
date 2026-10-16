@@ -587,7 +587,8 @@ int store_forward_init(void)
     LOG_I("Store & Forward persistent queue ready (Part='%s', Capacity=768 KB)", SF_PARTITION_NAME);
     return RT_EOK;
 }
-INIT_APP_EXPORT(store_forward_init);
+/* Depends on Flash/FAL, parameters and NTN service. */
+INIT_ENV_EXPORT(store_forward_init);
 
 /* MSH Diagnostics */
 static void sf_status(int argc, char **argv)

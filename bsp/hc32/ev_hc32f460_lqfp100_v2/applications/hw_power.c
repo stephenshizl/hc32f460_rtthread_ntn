@@ -89,7 +89,8 @@ int hw_power_init(void)
 
     return RT_EOK;
 }
-INIT_APP_EXPORT(hw_power_init);
+/* GPIO safe states and power rails must be ready before UART services start. */
+INIT_PREV_EXPORT(hw_power_init);
 
 /**
  * @brief Control NTN modem power rail (PB15) & PA power rail (PB0) with sequence
