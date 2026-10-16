@@ -89,6 +89,12 @@ int app_telemetry_init(void);
 rt_err_t app_telemetry_trigger_now(void);
 
 /**
+ * @brief Set terminal operational mode (0: NTN Bridge, 1: Auto Telemetry, 2: Modbus, 3: CAN)
+ * @param mode Target operational mode
+ */
+void app_telemetry_set_mode(rt_uint8_t mode);
+
+/**
  * @brief Get diagnostic statistics
  * @param out_stats Pointer to output statistics structure
  */

@@ -41,14 +41,124 @@ static char                    *_cur_resp_buf      = RT_NULL;
 static rt_size_t                _cur_resp_sz       = 0;
 static rt_size_t                _cur_resp_idx      = 0;
 
+/* AT Line Assembly & Incomplete Command Guard */
+static rt_uint8_t               _at_line_buf[512];
+static rt_size_t                _at_line_len       = 0;
+static rt_timer_t               _at_timeout_timer  = RT_NULL;
+
+static void at_line_timeout_entry(void *parameter)
+{
+    RT_UNUSED(parameter);
+
+    if (_at_line_len > 0)
+    {
+        LOG_W("[NTN BRIDGE] PC AT cmd timeout (>2s, %d B discarded, missing CRLF): %.*s",
+              _at_line_len, _at_line_len, _at_line_buf);
+        _at_line_len = 0;
+        /* Notify PC that the truncated command resulted in ERROR */
+        pc_rs232_send_str("\r\nERROR\r\n");
+    }
+}
+
+void ntn_bridge_process_pc_data(const rt_uint8_t *data, rt_size_t len)
+{
+    if (!_bridge_active || !_ntn_dev || !data || len == 0)
+    {
+        return;
+    }
+
+    _stats.bridge_pc_rx += len;
+
+    for (rt_size_t i = 0; i < len; i++)
+    {
+        rt_uint8_t ch = data[i];
+
+        if (_at_line_len == 0)
+        {
+            /* Skip leading whitespace or standalone CRLF */
+            if (ch == '\r' || ch == '\n' || ch == ' ')
+            {
+                continue;
+            }
+
+            /* If first character does not start an AT command, treat as raw transparent stream */
+            if (ch != 'A' && ch != 'a' && ch != '+')
+            {
+                rt_size_t rem = len - i;
+                rt_device_write(_ntn_dev, 0, &data[i], rem);
+                _stats.tx_bytes += rem;
+                return;
+            }
+
+            /* Start 2-second timeout timer for incomplete command detection */
+            if (_at_timeout_timer)
+            {
+                rt_timer_stop(_at_timeout_timer);
+                rt_timer_start(_at_timeout_timer);
+            }
+        }
+
+        /* Append character to assembly line buffer */
+        if (_at_line_len < sizeof(_at_line_buf) - 2)
+        {
+            _at_line_buf[_at_line_len++] = ch;
+        }
+        else
+        {
+            /* Line buffer overflow protection */
+            LOG_E("[NTN BRIDGE] AT line buffer overflow (>512 B)!");
+            _at_line_len = 0;
+            if (_at_timeout_timer)
+            {
+                rt_timer_stop(_at_timeout_timer);
+            }
+            pc_rs232_send_str("\r\nERROR\r\n");
+            return;
+        }
+
+        /* Check for command line termination: \r or \n */
+        if (ch == '\r' || ch == '\n')
+        {
+            if (_at_timeout_timer)
+            {
+                rt_timer_stop(_at_timeout_timer);
+            }
+
+            /* If \r is followed by \n in the same buffer, consume it */
+            if (ch == '\r' && (i + 1 < len) && data[i + 1] == '\n')
+            {
+                i++;
+                if (_at_line_len < sizeof(_at_line_buf) - 1)
+                {
+                    _at_line_buf[_at_line_len++] = '\n';
+                }
+            }
+            else if (ch == '\r')
+            {
+                /* Standardize: append \n if missing */
+                if (_at_line_len < sizeof(_at_line_buf) - 1)
+                {
+                    _at_line_buf[_at_line_len++] = '\n';
+                }
+            }
+
+            _at_line_buf[_at_line_len] = '\0';
+
+            /* Deliver full command atomically to NTN modem at 115200 bps */
+            rt_device_write(_ntn_dev, 0, _at_line_buf, _at_line_len);
+            _stats.tx_bytes += _at_line_len;
+            _stats.at_cmds_sent++;
+
+            LOG_D("[PC->NTN Bridge] Forwarded complete AT cmd (%d B): %s", _at_line_len, _at_line_buf);
+
+            _at_line_len = 0;
+        }
+    }
+}
+
 static void ntn_pc_bridge_rx_handler(const rt_uint8_t *data, rt_size_t len)
 {
-    if (_bridge_active && _ntn_dev && data && len > 0)
-    {
-        rt_size_t sent = rt_device_write(_ntn_dev, 0, data, len);
-        _stats.bridge_pc_rx += sent;
-        _stats.tx_bytes     += sent;
-    }
+    ntn_bridge_process_pc_data(data, len);
 }
 
 static rt_err_t ntn_uart_rx_ind(rt_device_t dev, rt_size_t size)
@@ -59,28 +169,35 @@ static rt_err_t ntn_uart_rx_ind(rt_device_t dev, rt_size_t size)
 
 static void ntn_rx_thread_entry(void *parameter)
 {
-    rt_uint8_t rx_byte;
+    rt_uint8_t rx_buf[64];
 
     LOG_I("NTN MS150 receiver thread running...");
 
     while (1)
     {
-        while (rt_device_read(_ntn_dev, 0, &rx_byte, 1) == 1)
+        rt_size_t read_bytes;
+        while ((read_bytes = rt_device_read(_ntn_dev, 0, rx_buf, sizeof(rx_buf))) > 0)
         {
-            _stats.rx_bytes++;
+            _stats.rx_bytes += read_bytes;
 
-            /* 1. If bridge mode is active, forward byte to PC RS232 port */
+            /* 1. If bridge mode is active, forward bytes to PC RS232 port */
             if (_bridge_active)
             {
-                pc_rs232_send(&rx_byte, 1);
-                _stats.bridge_ntn_to_pc++;
+                pc_rs232_send(rx_buf, read_bytes);
+                _stats.bridge_ntn_to_pc += read_bytes;
             }
 
             /* 2. If an AT command is synchronously waiting for a response */
-            if (_cmd_waiting && _cur_resp_buf && (_cur_resp_idx < _cur_resp_sz - 1))
+            if (_cmd_waiting && _cur_resp_buf)
             {
-                _cur_resp_buf[_cur_resp_idx++] = (char)rx_byte;
-                _cur_resp_buf[_cur_resp_idx] = '\0';
+                for (rt_size_t i = 0; i < read_bytes; i++)
+                {
+                    if (_cur_resp_idx < _cur_resp_sz - 1)
+                    {
+                        _cur_resp_buf[_cur_resp_idx++] = (char)rx_buf[i];
+                        _cur_resp_buf[_cur_resp_idx] = '\0';
+                    }
+                }
 
                 /* Check for completion keywords */
                 if (_cur_resp_idx >= 4)
@@ -173,6 +290,13 @@ int ntn_ms150_init(void)
         return -RT_ERROR;
     }
     rt_thread_startup(_rx_thread);
+
+    /* 9. Create AT line assembly timeout timer */
+    _at_timeout_timer = rt_timer_create("at_to",
+                                        at_line_timeout_entry,
+                                        RT_NULL,
+                                        rt_tick_from_millisecond(2000),
+                                        RT_TIMER_FLAG_ONE_SHOT);
 
     _inited = RT_TRUE;
     LOG_I("MS150 NTN Modem ready: %s @ 115200 8N1", NTN_UART_NAME);
@@ -419,14 +543,19 @@ void ntn_bridge_set(rt_bool_t enable)
     if (enable)
     {
         _bridge_active = RT_TRUE;
+        _at_line_len   = 0;
         pc_rs232_set_rx_handler(ntn_pc_bridge_rx_handler);
-        LOG_I("PC RS232 <-> NTN MS150 Transparent Bridge ENABLED");
+        LOG_I("PC RS232 <-> NTN MS150 Transparent Bridge ENABLED (Default Mode 0)");
         pc_rs232_send_str("\r\n[NTN BRIDGE] PC <-> NTN MS150 Bridge Active (19200 <-> 115200)\r\n");
     }
     else
     {
         _bridge_active = RT_FALSE;
-        pc_rs232_set_rx_handler(RT_NULL);
+        _at_line_len   = 0;
+        if (_at_timeout_timer)
+        {
+            rt_timer_stop(_at_timeout_timer);
+        }
         LOG_I("PC RS232 <-> NTN MS150 Transparent Bridge DISABLED");
         pc_rs232_send_str("\r\n[NTN BRIDGE] Bridge Disabled\r\n");
     }

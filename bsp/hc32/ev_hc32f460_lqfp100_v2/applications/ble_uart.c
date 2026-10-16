@@ -10,7 +10,11 @@
 
 #include "ble_uart.h"
 #include "hw_power.h"
+#include "param_manager.h"
+#include "gnss_um220.h"
+#include "ntn_ms150.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include "task_wdt.h"
 
 #define DBG_TAG "ble.uart"
@@ -118,6 +122,81 @@ static void ble_handle_frame(const rt_uint8_t *frame, rt_size_t len)
                     }
                     rt_uint8_t ack = _log_stream_on ? 1 : 0;
                     ble_send_frame(BLE_CMD_LOG_STREAM, seq, &ack, 1);
+                    break;
+                }
+                case BLE_CMD_DEV_CONFIG:
+                {
+                    /*
+                     * Payload: [SubCmd] [Params...]
+                     * SubCmd 0x01: Query Work Mode -> Resp: [0x01][Mode]
+                     * SubCmd 0x02: Set Work Mode   -> Resp: [0x02][Status 0:OK,1:ERR][Mode]
+                     */
+                    if (payload_len >= 1)
+                    {
+                        rt_uint8_t sub_cmd = frame[6];
+                        if (sub_cmd == 0x01)
+                        {
+                            rt_uint8_t resp[2];
+                            resp[0] = 0x01;
+                            resp[1] = param_get_work_mode();
+                            ble_send_frame(BLE_CMD_DEV_CONFIG, seq, resp, sizeof(resp));
+                            LOG_I("[BLE] Phone App queried work mode: %d", resp[1]);
+                        }
+                        else if (sub_cmd == 0x02 && payload_len >= 2)
+                        {
+                            rt_uint8_t target_mode = frame[7];
+                            rt_err_t err = param_set_work_mode(target_mode, RT_TRUE);
+                            if (err == RT_EOK)
+                            {
+                                ntn_bridge_set(target_mode == PARAM_MODE_NTN_BRIDGE);
+                            }
+                            rt_uint8_t resp[3];
+                            resp[0] = 0x02;
+                            resp[1] = (err == RT_EOK) ? 0x00 : 0x01;
+                            resp[2] = param_get_work_mode();
+                            ble_send_frame(BLE_CMD_DEV_CONFIG, seq, resp, sizeof(resp));
+                            LOG_I("[BLE] Phone App switched work mode to %d (status=%d)", target_mode, resp[1]);
+                        }
+                    }
+                    break;
+                }
+                case BLE_CMD_GNSS_INFO:
+                {
+                    gnss_data_t gnss;
+                    gnss_get_data(&gnss);
+                    char resp[128];
+                    rt_snprintf(resp, sizeof(resp),
+                                "{\"fix\":%d,\"sats\":%d,\"lat\":%d,\"lon\":%d,\"spd\":%d,\"hdg\":%d}",
+                                gnss.is_fixed ? 1 : 0,
+                                gnss.sats_used,
+                                (int)(gnss.latitude_e7 / 10),
+                                (int)(gnss.longitude_e7 / 10),
+                                (int)(gnss.speed_kmh * 10),
+                                (int)gnss.course);
+                    ble_send_frame(BLE_CMD_GNSS_INFO, seq, (const rt_uint8_t *)resp, rt_strlen(resp));
+                    break;
+                }
+                case BLE_CMD_NTN_AT_PASS:
+                {
+                    /* Phone App sends AT command to MS150 modem over BLE */
+                    if (payload_len > 0)
+                    {
+                        char at_cmd[128];
+                        char at_resp[256];
+                        rt_size_t c_len = (payload_len < sizeof(at_cmd) - 1) ? payload_len : sizeof(at_cmd) - 1;
+                        rt_memcpy(at_cmd, &frame[6], c_len);
+                        at_cmd[c_len] = '\0';
+
+                        rt_err_t res = ntn_exec_cmd(at_cmd, at_resp, sizeof(at_resp), 3000);
+                        if (res == RT_EOK)
+                        {
+                            ble_send_frame(BLE_CMD_NTN_AT_PASS, seq, (const rt_uint8_t *)at_resp, rt_strlen(at_resp));
+                        }
+                        else
+                        {
+                            ble_send_frame(BLE_CMD_NTN_AT_PASS, seq, (const rt_uint8_t *)"\r\nERROR\r\n", 9);
+                        }
+                    }
                     break;
                 }
                 default:

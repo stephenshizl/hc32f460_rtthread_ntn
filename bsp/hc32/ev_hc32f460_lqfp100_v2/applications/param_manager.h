@@ -20,8 +20,10 @@ extern "C" {
 
 /* Operational modes */
 #define PARAM_MODE_RAW_PASS         0   /* 0: Transparent RS232 Raw Bridge (IR-9680 compatible) */
+#define PARAM_MODE_NTN_BRIDGE       0   /* Alias: Default NTN Transparent Modem Bridge (PC treats MCU as NTN) */
 #define PARAM_MODE_AUTO_TELEMETRY   1   /* 1: Auto GNSS / Sensor Telemetry Report */
 #define PARAM_MODE_MODBUS           2   /* 2: Modbus RTU Master Polling Mode */
+#define PARAM_MODE_CUSTOM_CAN       3   /* 3: Reserved: Custom CAN / Sensor Protocol Mode */
 
 #define PARAM_STR_MAX_LEN           32
 #define PARAM_SN_MAX_LEN            24

@@ -409,9 +409,10 @@ static void param_dump(int argc, char **argv)
     rt_kprintf(" ------------------------------------------------------------\n");
 
     const char *mode_str = "UNKNOWN";
-    if (c->work_mode == PARAM_MODE_RAW_PASS) mode_str = "RAW_PASS (0: Transparent RS232)";
+    if (c->work_mode == PARAM_MODE_RAW_PASS) mode_str = "NTN_BRIDGE (0: PC treats MCU as NTN)";
     else if (c->work_mode == PARAM_MODE_AUTO_TELEMETRY) mode_str = "AUTO_TELEMETRY (1: GNSS/Sensor Auto Report)";
     else if (c->work_mode == PARAM_MODE_MODBUS) mode_str = "MODBUS (2: Industrial Polling)";
+    else if (c->work_mode == PARAM_MODE_CUSTOM_CAN) mode_str = "CUSTOM_CAN (3: CAN / Custom Protocol)";
 
     rt_kprintf(" Work Mode       : %s\n", mode_str);
     rt_kprintf(" Report Interval : %d Seconds\n", c->report_interval_s);

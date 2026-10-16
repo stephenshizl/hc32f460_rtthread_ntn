@@ -33,7 +33,6 @@
 static telem_stats_t    s_stats;
 static rt_thread_t      s_telem_thread = RT_NULL;
 static rt_uint16_t      s_telem_seq = 1;
-static rt_uint16_t      s_rs232_seq = 1;
 static volatile rt_bool_t s_trigger_now = RT_FALSE;
 static rt_bool_t        s_telem_inited = RT_FALSE;
 
@@ -71,45 +70,20 @@ static void app_telemetry_rs232_rx_handler(const rt_uint8_t *data, rt_size_t len
 
     rt_uint8_t mode = param_get_work_mode();
 
-    /* In RAW_PASS mode, all PC RS232 frames are enveloped and enqueued for satellite transmission */
-    if (mode == PARAM_MODE_RAW_PASS)
+    /* Mode 0: NTN Transparent Modem Bridge (PC treats MCU as NTN module) */
+    if (mode == PARAM_MODE_NTN_BRIDGE || mode == PARAM_MODE_RAW_PASS)
     {
-        rt_size_t total_len = sizeof(ntap_rs232_hdr_t) + len;
-        rt_uint8_t *env_buf = (rt_uint8_t *)rt_malloc(total_len);
-        if (!env_buf)
-        {
-            LOG_E("Out of memory for RS232 NTAP envelope!");
-            return;
-        }
-
-        ntap_rs232_hdr_t *hdr = (ntap_rs232_hdr_t *)env_buf;
-        hdr->msg_type  = NTAP_MSG_TYPE_RS232_RAW;
-        hdr->reserved  = 0x00;
-        hdr->seq_id    = s_rs232_seq++;
-        hdr->timestamp = rt_tick_get();
-        hdr->raw_len   = (rt_uint16_t)len;
-
-        rt_memcpy(env_buf + sizeof(ntap_rs232_hdr_t), data, len);
-
-        rt_uint32_t flash_seq = 0;
-        rt_err_t res = store_forward_push(env_buf, total_len, &flash_seq);
-        rt_free(env_buf);
-
-        if (res == RT_EOK)
-        {
-            s_stats.rs232_frames_fwd++;
-            LOG_I("[RS232->NTN] Enqueued %d B raw payload to Store&Forward (SeqID=%d)", len, flash_seq);
-            store_forward_trigger_flush();
-        }
-        else
-        {
-            LOG_E("Failed to enqueue RS232 payload to Store&Forward (err=%d)", res);
-        }
+        ntn_bridge_process_pc_data(data, len);
     }
     else if (mode == PARAM_MODE_MODBUS)
     {
-        /* In MODBUS mode, RS232 frames are slave responses -> route to Modbus engine */
+        /* Mode 2: Modbus RTU Master mode */
         app_modbus_on_rx_frame(data, len);
+    }
+    else if (mode == PARAM_MODE_AUTO_TELEMETRY)
+    {
+        /* Mode 1: Autonomous Telemetry mode - also allow PC AT queries/commands */
+        ntn_bridge_process_pc_data(data, len);
     }
 }
 
@@ -265,11 +239,31 @@ int app_telemetry_init(void)
         return -RT_ERROR;
     }
 
+    /* 4. If default mode is NTN bridge, activate bridge */
+    if (param_get_work_mode() == PARAM_MODE_NTN_BRIDGE ||
+        param_get_work_mode() == PARAM_MODE_RAW_PASS)
+    {
+        ntn_bridge_set(RT_TRUE);
+    }
+
     s_telem_inited = RT_TRUE;
     LOG_I("Automated Telemetry Engine initialized successfully.");
     return RT_EOK;
 }
 INIT_APP_EXPORT(app_telemetry_init);
+
+void app_telemetry_set_mode(rt_uint8_t mode)
+{
+    param_set_work_mode(mode, RT_TRUE);
+    if (mode == PARAM_MODE_NTN_BRIDGE || mode == PARAM_MODE_RAW_PASS)
+    {
+        ntn_bridge_set(RT_TRUE);
+    }
+    else
+    {
+        ntn_bridge_set(RT_FALSE);
+    }
+}
 
 /* MSH Diagnostic Commands */
 static void telem_status(int argc, char **argv)
@@ -280,12 +274,16 @@ static void telem_status(int argc, char **argv)
     gnss_data_t gnss;
     gnss_get_data(&gnss);
 
+    const char *mode_name = "UNKNOWN";
+    rt_uint8_t cur_mode = param_get_work_mode();
+    if (cur_mode == PARAM_MODE_NTN_BRIDGE) mode_name = "NTN_BRIDGE (0: PC treats MCU as NTN)";
+    else if (cur_mode == PARAM_MODE_AUTO_TELEMETRY) mode_name = "AUTO_TELEMETRY (1: GNSS/Sensor Auto Report)";
+    else if (cur_mode == PARAM_MODE_MODBUS) mode_name = "MODBUS (2: Industrial Polling)";
+    else if (cur_mode == PARAM_MODE_CUSTOM_CAN) mode_name = "CUSTOM_CAN (3: CAN / Custom Protocol)";
+
     rt_kprintf("\n============= Automated Telemetry Status =============\n");
     rt_kprintf(" Engine State       : %s\n", st.engine_running ? "RUNNING" : "STOPPED");
-    rt_kprintf(" Work Mode          : %d (%s)\n",
-               param_get_work_mode(),
-               param_get_work_mode() == 0 ? "RAW_PASS" :
-               param_get_work_mode() == 1 ? "AUTO_TELEMETRY" : "MODBUS");
+    rt_kprintf(" Work Mode          : %d (%s)\n", cur_mode, mode_name);
     rt_kprintf(" Report Interval    : %d Seconds\n", param_get_report_interval());
     rt_kprintf(" Telemetry Packets  : %d Generated\n", st.telem_frames_gen);
     rt_kprintf(" RS232 Raw Envelopes: %d Enqueued\n", st.rs232_frames_fwd);
@@ -330,21 +328,21 @@ static void telem_mode(int argc, char **argv)
 {
     if (argc < 2)
     {
-        rt_kprintf("Usage: telem_mode <0:RawPass, 1:AutoTelemetry, 2:Modbus>\n");
+        rt_kprintf("Usage: telem_mode <0:NTN_Bridge, 1:AutoTelemetry, 2:Modbus, 3:CustomCAN>\n");
         return;
     }
 
     int mode = atoi(argv[1]);
-    if (mode < 0 || mode > 2)
+    if (mode < 0 || mode > 3)
     {
-        rt_kprintf("Invalid mode! 0:RawPass, 1:AutoTelemetry, 2:Modbus\n");
+        rt_kprintf("Invalid mode! 0:NTN_Bridge, 1:AutoTelemetry, 2:Modbus, 3:CustomCAN\n");
         return;
     }
 
-    param_set_work_mode((rt_uint8_t)mode, RT_TRUE);
+    app_telemetry_set_mode((rt_uint8_t)mode);
     rt_kprintf("Work mode switched to %d and committed to Flash.\n", mode);
 }
-MSH_CMD_EXPORT(telem_mode, Set terminal operational mode: telem_mode <0|1|2>);
+MSH_CMD_EXPORT(telem_mode, Set terminal operational mode: telem_mode <0|1|2|3>);
 
 static void telem_interval(int argc, char **argv)
 {

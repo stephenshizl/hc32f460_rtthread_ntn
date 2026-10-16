@@ -151,6 +151,13 @@ void ntn_bridge_set(rt_bool_t enable);
 rt_bool_t ntn_bridge_is_enabled(void);
 
 /**
+ * @brief Process PC RS232 data in NTN bridge mode with line assembly and incomplete packet guard
+ * @param data Pointer to incoming buffer
+ * @param len  Length of buffer
+ */
+void ntn_bridge_process_pc_data(const rt_uint8_t *data, rt_size_t len);
+
+/**
  * @brief Send UDP hex payload over satellite network via MS150
  * @param socket_id Socket ID (1-4)
  * @param hex_payload Hex-encoded ASCII string (e.g. "0031323334")
