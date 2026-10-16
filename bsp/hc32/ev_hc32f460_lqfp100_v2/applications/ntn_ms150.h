@@ -21,8 +21,9 @@ extern "C" {
 
 #define NTN_UART_NAME           "uart3"         /* HC32F460 USART3: PB4(TX), PB5(RX) */
 #define NTN_DEFAULT_BAUDRATE    BAUD_RATE_115200/* MS150 standard baudrate */
-#define NTN_RESP_BUF_MAX_SZ     512             /* Response buffer size */
+#define NTN_RESP_BUF_MAX_SZ     1536            /* Includes one maximum HEX downlink line */
 #define NTN_DEFAULT_TIMEOUT_MS  3000            /* Default AT timeout in ms */
+#define NTN_DOWNLINK_MAX_LEN    700U
 
 /**
  * @brief NTN Network Registration Status (from AT+CEREG?)
@@ -79,6 +80,44 @@ typedef struct
     rt_uint32_t bridge_pc_rx;      /* Bytes received from PC RS232 in bridge mode */
     rt_uint32_t bridge_ntn_to_pc;  /* Bytes forwarded from NTN to PC */
 } ntn_stats_t;
+
+typedef enum
+{
+    NTN_SERVICE_DISABLED = 0,
+    NTN_SERVICE_NOT_CONFIGURED,
+    NTN_SERVICE_PROBING,
+    NTN_SERVICE_REGISTERING,
+    NTN_SERVICE_OPENING,
+    NTN_SERVICE_READY,
+    NTN_SERVICE_BACKOFF
+} ntn_service_state_t;
+
+typedef struct
+{
+    ntn_service_state_t state;
+    ntn_reg_status_t reg_status;
+    rt_bool_t send_ready;
+    rt_int32_t last_error;
+    rt_uint32_t reconnect_count;
+    rt_uint32_t modem_accepted_count;
+    rt_uint32_t unknown_result_count;
+    rt_uint32_t downlink_count;
+    rt_uint32_t downlink_parse_errors;
+} ntn_service_status_t;
+
+typedef struct
+{
+    rt_bool_t valid;
+    rt_uint8_t socket_id;
+    rt_uint16_t data_len;
+    rt_uint32_t sequence;
+    rt_tick_t received_tick;
+    rt_uint8_t data[NTN_DOWNLINK_MAX_LEN];
+} ntn_downlink_t;
+
+typedef void (*ntn_raw_rx_handler_t)(const rt_uint8_t *data, rt_size_t len,
+                                     rt_bool_t command_associated);
+typedef void (*ntn_downlink_handler_t)(const ntn_downlink_t *downlink);
 
 /**
  * @brief Initialize MS150 NTN module driver and UART3 interface
@@ -164,6 +203,18 @@ void ntn_bridge_process_pc_data(const rt_uint8_t *data, rt_size_t len);
  * @return RT_EOK on success
  */
 rt_err_t ntn_send_udp_hex(rt_uint8_t socket_id, const char *hex_payload);
+
+/* V3 automatic mode-1 service. All UART3 writes remain inside this module. */
+rt_bool_t ntn_service_is_send_ready(void);
+rt_err_t ntn_service_send_raw(const rt_uint8_t *payload, rt_size_t len);
+void ntn_service_request_reconnect(void);
+void ntn_service_get_status(ntn_service_status_t *out_status);
+rt_bool_t ntn_service_get_last_downlink(ntn_downlink_t *out_downlink);
+rt_err_t ntn_debug_lock_acquire(void);
+void ntn_debug_lock_release(void);
+rt_bool_t ntn_debug_lock_is_held(void);
+void ntn_set_raw_rx_handler(ntn_raw_rx_handler_t handler);
+void ntn_set_downlink_handler(ntn_downlink_handler_t handler);
 
 /**
  * @brief Get diagnostic traffic statistics

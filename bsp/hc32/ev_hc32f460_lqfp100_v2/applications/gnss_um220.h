@@ -34,6 +34,10 @@ typedef struct
 {
     /* Positioning status */
     rt_bool_t   is_fixed;          /* RT_TRUE if positioning fix is valid */
+    rt_bool_t   time_valid;        /* RMC date and UTC time are valid */
+    rt_bool_t   altitude_valid;    /* GGA altitude belongs to a valid fix */
+    rt_bool_t   speed_valid;       /* RMC speed field is valid */
+    rt_bool_t   course_valid;      /* RMC course field is valid */
     rt_uint8_t  fix_quality;       /* 0=Invalid, 1=SPS, 2=DGPS, 4=RTK Fixed, 5=RTK Float */
     rt_uint8_t  sats_used;         /* Number of satellites in use */
 
@@ -49,10 +53,12 @@ typedef struct
 
     /* Navigation metrics */
     float       altitude;          /* Altitude in meters above sea level */
+    rt_int32_t  altitude_mm;       /* Altitude in millimetres */
     float       hdop;              /* Horizontal Dilution of Precision */
     rt_uint32_t speed_cm_s;        /* Ground speed in cm/s (fixed-point integer) */
     float       speed_kmh;         /* Ground speed in km/h */
     float       course;            /* Heading / Course over ground in degrees (0.0~360.0) */
+    rt_uint16_t course_cdeg;       /* Heading in centidegrees */
 
     /* UTC Date & Time components */
     rt_uint8_t  hour;              /* UTC Hour: 0-23 */
@@ -66,6 +72,7 @@ typedef struct
     rt_uint32_t utc_time;          /* Legacy composite Time: HHMMSS (e.g. 101500) */
 
     rt_tick_t   last_update_tick;  /* System tick of last valid update */
+    rt_tick_t   time_update_tick;  /* System tick of last valid RMC date/time */
 } gnss_data_t;
 
 /**
@@ -120,6 +127,20 @@ void gnss_get_stats(gnss_stats_t *out_stats);
  * @return Bytes sent
  */
 rt_size_t gnss_send_cmd(const char *cmd);
+
+/**
+ * @brief Configure UM220-IV-M for all supported constellations and required NMEA output
+ *
+ * The runtime configuration enables GPS/BDS/Galileo/SBAS/QZSS (CFGSYS,H11)
+ * plus GGA/GSA/GSV/RMC at 1 Hz.  It is sent after every module reset and is not
+ * saved repeatedly to the module's internal nonvolatile memory.
+ */
+rt_err_t gnss_configure_all(void);
+
+/**
+ * @brief Return whether the last automatic UM220 configuration completed successfully
+ */
+rt_bool_t gnss_is_configured(void);
 
 /**
  * @brief Set GNSS baudrate dynamically

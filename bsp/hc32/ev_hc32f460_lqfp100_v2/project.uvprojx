@@ -430,6 +430,21 @@
               <FilePath>applications\param_manager.c</FilePath>
             </File>
             <File>
+              <FileName>mcu_local_cmd.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>applications\mcu_local_cmd.c</FilePath>
+            </File>
+            <File>
+              <FileName>raw_uplink.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>applications\raw_uplink.c</FilePath>
+            </File>
+            <File>
+              <FileName>loc2_report.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>applications\loc2_report.c</FilePath>
+            </File>
+            <File>
               <FileName>pc_rs232.c</FileName>
               <FileType>1</FileType>
               <FilePath>applications\pc_rs232.c</FilePath>

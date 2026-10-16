@@ -13,7 +13,6 @@
 #include "param_manager.h"
 #include "pc_rs232.h"
 #include "store_forward.h"
-#include "task_wdt.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -25,14 +24,10 @@
 #define DBG_LVL DBG_INFO
 #include <rtdbg.h>
 
-#define MODBUS_THREAD_STACK_SZ  2048
-#define MODBUS_THREAD_PRIO      16
-
 static modbus_channel_t s_channels[MODBUS_MAX_CHANNELS];
 static modbus_stats_t   s_stats;
 static struct rt_mutex  s_mb_lock;
 static struct rt_semaphore s_mb_resp_sem;
-static rt_thread_t      s_mb_thread = RT_NULL;
 
 static rt_uint8_t       s_resp_buf[256];
 static rt_size_t        s_resp_len = 0;
@@ -281,8 +276,6 @@ rt_err_t app_modbus_poll_channel(rt_uint8_t ch_idx)
             LOG_I("[MODBUS] Ch%d Polled OK (Slave %d, Regs 0x%04X..0x%04X) -> Store&Forward Seq=%d",
                   ch_idx, ch->slave_addr, ch->start_reg, ch->start_reg + ch->reg_count - 1, flash_seq);
 
-            /* Trigger satellite flush */
-            store_forward_trigger_flush();
         }
         return RT_EOK;
     }
@@ -292,40 +285,6 @@ rt_err_t app_modbus_poll_channel(rt_uint8_t ch_idx)
         LOG_W("[MODBUS] Ch%d Poll failed! Slave=%d, Func=0x%02X, Reg=0x%04X (err=%d)",
               ch_idx, ch->slave_addr, ch->func_code, ch->start_reg, res);
         return res;
-    }
-}
-
-/* Polling daemon thread */
-static void modbus_master_thread_entry(void *param)
-{
-    LOG_I("Modbus RTU Master auto-polling daemon started.");
-
-    while (1)
-    {
-        rt_thread_mdelay(1000);
-        task_wdt_heartbeat_by_name("modbus");
-
-        /* Only poll when system is configured for MODBUS mode */
-        if (param_get_work_mode() != PARAM_MODE_MODBUS)
-        {
-            continue;
-        }
-
-        rt_tick_t now = rt_tick_get();
-
-        for (rt_uint8_t i = 0; i < MODBUS_MAX_CHANNELS; i++)
-        {
-            modbus_channel_t *ch = &s_channels[i];
-            if (ch->is_enabled)
-            {
-                rt_uint32_t period_ticks = rt_tick_from_millisecond(ch->poll_period_s * 1000);
-                if (now - ch->last_poll_tick >= period_ticks)
-                {
-                    app_modbus_poll_channel(i);
-                    rt_thread_mdelay(200); /* Small spacing between polls */
-                }
-            }
-        }
     }
 }
 
@@ -367,30 +326,10 @@ int app_modbus_init(void)
     s_channels[0].start_reg     = 0x0000;                   /* Reg 0 */
     s_channels[0].reg_count     = 4;                        /* 4 registers: Fuel level, Temp, Volt, Status */
     s_channels[0].poll_period_s = 60;                       /* Poll every 60 seconds */
-    s_channels[0].is_enabled    = RT_TRUE;
-
-    /* Register with Task Watchdog */
-    task_wdt_register("modbus", 60);
-
-    /* Start background master polling thread */
-    s_mb_thread = rt_thread_create("mb_poll",
-                                   modbus_master_thread_entry,
-                                   RT_NULL,
-                                   MODBUS_THREAD_STACK_SZ,
-                                   MODBUS_THREAD_PRIO,
-                                   10);
-    if (s_mb_thread != RT_NULL)
-    {
-        rt_thread_startup(s_mb_thread);
-    }
-    else
-    {
-        LOG_E("Failed to create Modbus Master polling thread!");
-        return -RT_ERROR;
-    }
+    s_channels[0].is_enabled    = RT_FALSE;
 
     s_mb_inited = RT_TRUE;
-    LOG_I("Modbus RTU Master Collector ready (Default Ch0: Slave 1, 4 Regs @ 60s)");
+    LOG_I("Modbus interfaces reserved; V3 automatic polling is disabled");
     return RT_EOK;
 }
 INIT_APP_EXPORT(app_modbus_init);

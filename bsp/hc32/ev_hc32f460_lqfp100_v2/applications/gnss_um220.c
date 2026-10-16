@@ -23,6 +23,12 @@
 
 #define GNSS_THREAD_STACK_SZ    2048
 #define GNSS_THREAD_PRIO        12
+#define GNSS_CFG_THREAD_STACK_SZ 1536
+#define GNSS_CFG_THREAD_PRIO     13
+#define GNSS_CFG_RESP_MAX_SZ     128
+#define GNSS_CFG_CMD_MAX_SZ      64
+#define GNSS_CFG_TIMEOUT_MS      1500U
+#define GNSS_CFG_RETRY_COUNT     2U
 
 #define NMEA_MAX_FIELDS         20
 
@@ -45,14 +51,34 @@ typedef enum
 
 static rt_device_t              _gnss_dev          = RT_NULL;
 static struct rt_semaphore      _sem_rx;
+static struct rt_semaphore      _sem_cmd;
 static struct rt_mutex          _mutex_data;
+static struct rt_mutex          _mutex_cmd;
 static rt_thread_t              _rx_thread         = RT_NULL;
+static rt_thread_t              _cfg_thread        = RT_NULL;
 
 static gnss_data_t              _gnss_data;
 static gnss_stats_t             _gnss_stats;
 static gnss_sentence_handler_t  _sentence_handler  = RT_NULL;
 static rt_bool_t                _raw_log           = RT_FALSE;
 static rt_bool_t                _inited            = RT_FALSE;
+static volatile rt_bool_t       _cmd_waiting       = RT_FALSE;
+static volatile rt_err_t        _cmd_status        = -RT_ETIMEOUT;
+static char                    *_cmd_resp_buf       = RT_NULL;
+static rt_size_t                _cmd_resp_size      = 0U;
+static rt_size_t                _cmd_resp_index     = 0U;
+static volatile rt_bool_t       _configured        = RT_FALSE;
+
+/* UM220-IV-M protocol bodies. Checksums are generated when commands are sent. */
+static const char * const _gnss_cfg_bodies[] =
+{
+    "CFGSYS,H11",       /* GPS + BDS + Galileo + SBAS + QZSS */
+    "CFGNMEA,H51",      /* NMEA 4.1 */
+    "CFGMSG,0,0,1",     /* GGA, 1 Hz */
+    "CFGMSG,0,2,1",     /* GSA, 1 Hz */
+    "CFGMSG,0,3,1",     /* GSV, 1 Hz */
+    "CFGMSG,0,4,1"      /* RMC, 1 Hz */
+};
 
 /* ------------------- High-Robustness NMEA Parsing Engine ------------------- */
 
@@ -408,6 +434,8 @@ static nmea_res_t nmea_parse_rmc(const nmea_field_t *fields, rt_uint8_t field_co
     rt_int32_t lat_e7, lon_e7;
     rt_uint32_t speed_cm_s = 0U;
     float course = 0.0f;
+    rt_bool_t speed_valid = RT_FALSE;
+    rt_bool_t course_valid = RT_FALSE;
     rt_bool_t valid;
 
     if (field_count < 10U)
@@ -438,11 +466,12 @@ static nmea_res_t nmea_parse_rmc(const nmea_field_t *fields, rt_uint8_t field_co
 
     if (fields[7].length > 0U)
     {
-        nmea_parse_knots_to_cm_s(&fields[7], &speed_cm_s);
+        speed_valid = nmea_parse_knots_to_cm_s(&fields[7], &speed_cm_s) ? RT_TRUE : RT_FALSE;
     }
     if (fields[8].length > 0U)
     {
-        nmea_parse_float(&fields[8], &course);
+        course_valid = nmea_parse_float(&fields[8], &course) ? RT_TRUE : RT_FALSE;
+        if (course < 0.0f || course >= 360.0f) course_valid = RT_FALSE;
     }
 
     if (nmea_parse_date(&fields[9], &year, &month, &day) == 0U)
@@ -461,11 +490,24 @@ static nmea_res_t nmea_parse_rmc(const nmea_field_t *fields, rt_uint8_t field_co
     _gnss_data.month  = month;
     _gnss_data.day    = day;
     _gnss_data.utc_date = ((rt_uint32_t)day * 10000) + ((rt_uint32_t)month * 100) + (year % 100);
+    _gnss_data.time_valid = RT_TRUE;
+    _gnss_data.time_update_tick = rt_tick_get();
 
     _gnss_data.is_fixed   = valid;
     _gnss_data.speed_cm_s = speed_cm_s;
+    _gnss_data.speed_valid = speed_valid;
     _gnss_data.speed_kmh  = (float)speed_cm_s * 0.036f;
     _gnss_data.course     = course;
+    _gnss_data.course_valid = course_valid;
+    if (course_valid)
+    {
+        rt_uint32_t course_cdeg = (rt_uint32_t)(course * 100.0f + 0.5f);
+        _gnss_data.course_cdeg = (rt_uint16_t)((course_cdeg > 35999U) ? 35999U : course_cdeg);
+    }
+    else
+    {
+        _gnss_data.course_cdeg = 0U;
+    }
 
     if (valid)
     {
@@ -493,6 +535,7 @@ static nmea_res_t nmea_parse_gga(const nmea_field_t *fields, rt_uint8_t field_co
     rt_int32_t lat_e7, lon_e7;
     float hdop = 0.0f;
     float alt = 0.0f;
+    rt_bool_t altitude_valid = RT_FALSE;
 
     if (field_count < 10U)
     {
@@ -520,7 +563,7 @@ static nmea_res_t nmea_parse_gga(const nmea_field_t *fields, rt_uint8_t field_co
     }
     if (fields[9].length > 0U)
     {
-        nmea_parse_float(&fields[9], &alt);
+        altitude_valid = nmea_parse_float(&fields[9], &alt) ? RT_TRUE : RT_FALSE;
     }
 
     if (fix_quality > 0U)
@@ -544,6 +587,9 @@ static nmea_res_t nmea_parse_gga(const nmea_field_t *fields, rt_uint8_t field_co
     _gnss_data.sats_used   = (rt_uint8_t)satellites;
     _gnss_data.hdop        = hdop;
     _gnss_data.altitude    = alt;
+    _gnss_data.altitude_valid = (fix_quality > 0U && altitude_valid) ? RT_TRUE : RT_FALSE;
+    _gnss_data.altitude_mm = _gnss_data.altitude_valid ?
+        (rt_int32_t)((alt >= 0.0f) ? (alt * 1000.0f + 0.5f) : (alt * 1000.0f - 0.5f)) : 0;
     _gnss_data.is_fixed    = (fix_quality > 0U) ? RT_TRUE : RT_FALSE;
 
     if (fix_quality > 0U)
@@ -654,6 +700,207 @@ static void nmea_process_sentence(const char *sentence, rt_uint16_t length)
 
 /* ------------------- RT-Thread Device Interface & Threads ------------------- */
 
+static rt_bool_t gnss_line_is_navigation_nmea(const char *line, rt_uint16_t length)
+{
+    if (line == RT_NULL || length < 6U || line[0] != '$')
+    {
+        return RT_FALSE;
+    }
+
+    /* Standard GNSS talker IDs: GP, GN, BD/GB, GA, GL and GQ. */
+    if ((line[1] == 'G' &&
+         (line[2] == 'P' || line[2] == 'N' || line[2] == 'B' ||
+          line[2] == 'A' || line[2] == 'L' || line[2] == 'Q')) ||
+        (line[1] == 'B' && line[2] == 'D'))
+    {
+        return RT_TRUE;
+    }
+    return RT_FALSE;
+}
+
+static void gnss_command_process_line(const char *line, rt_uint16_t length)
+{
+    rt_size_t copy_len;
+
+    if (!_cmd_waiting || line == RT_NULL || length == 0U)
+    {
+        return;
+    }
+
+    if (_cmd_resp_buf != RT_NULL && _cmd_resp_size > 1U &&
+        _cmd_resp_index < (_cmd_resp_size - 1U))
+    {
+        copy_len = length;
+        if (copy_len > (_cmd_resp_size - 1U - _cmd_resp_index))
+        {
+            copy_len = _cmd_resp_size - 1U - _cmd_resp_index;
+        }
+        rt_memcpy(&_cmd_resp_buf[_cmd_resp_index], line, copy_len);
+        _cmd_resp_index += copy_len;
+        if (_cmd_resp_index < (_cmd_resp_size - 1U))
+        {
+            _cmd_resp_buf[_cmd_resp_index++] = '\n';
+        }
+        _cmd_resp_buf[_cmd_resp_index] = '\0';
+    }
+
+    if (length >= 3U && rt_strncmp(line, "$OK", 3U) == 0)
+    {
+        _cmd_status = RT_EOK;
+        _cmd_waiting = RT_FALSE;
+        rt_sem_release(&_sem_cmd);
+    }
+    else if (length >= 5U && rt_strncmp(line, "$FAIL", 5U) == 0)
+    {
+        _cmd_status = -RT_ERROR;
+        _cmd_waiting = RT_FALSE;
+        rt_sem_release(&_sem_cmd);
+    }
+}
+
+static rt_err_t gnss_exec_body(const char *body, char *response,
+                               rt_size_t response_size, rt_uint32_t timeout_ms)
+{
+    char frame[GNSS_CFG_CMD_MAX_SZ];
+    rt_uint8_t checksum = 0U;
+    rt_size_t body_len;
+    rt_size_t frame_len;
+    rt_size_t sent;
+    rt_err_t result;
+
+    if (!_inited || _gnss_dev == RT_NULL || body == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+    body_len = rt_strlen(body);
+    if (body_len == 0U || body_len > (GNSS_CFG_CMD_MAX_SZ - 8U))
+    {
+        return -RT_EINVAL;
+    }
+    if (rt_mutex_take(&_mutex_cmd, rt_tick_from_millisecond(timeout_ms + 500U)) != RT_EOK)
+    {
+        return -RT_EBUSY;
+    }
+
+    for (rt_size_t i = 0U; i < body_len; i++)
+    {
+        checksum ^= (rt_uint8_t)body[i];
+    }
+    frame_len = (rt_size_t)rt_snprintf(frame, sizeof(frame),
+                                       "$%s*%02X\r\n", body, checksum);
+    if (frame_len >= sizeof(frame))
+    {
+        rt_mutex_release(&_mutex_cmd);
+        return -RT_EINVAL;
+    }
+
+    while (rt_sem_trytake(&_sem_cmd) == RT_EOK)
+    {
+        /* Drain completion left by a previous timed-out transaction. */
+    }
+    _cmd_resp_buf = response;
+    _cmd_resp_size = response_size;
+    _cmd_resp_index = 0U;
+    if (response != RT_NULL && response_size > 0U)
+    {
+        response[0] = '\0';
+    }
+    _cmd_status = -RT_ETIMEOUT;
+    _cmd_waiting = RT_TRUE;
+
+    sent = rt_device_write(_gnss_dev, 0, frame, frame_len);
+    if (sent != frame_len)
+    {
+        _cmd_waiting = RT_FALSE;
+        result = -RT_EIO;
+    }
+    else if (rt_sem_take(&_sem_cmd, rt_tick_from_millisecond(timeout_ms)) == RT_EOK)
+    {
+        result = _cmd_status;
+    }
+    else
+    {
+        _cmd_waiting = RT_FALSE;
+        result = -RT_ETIMEOUT;
+    }
+
+    _cmd_resp_buf = RT_NULL;
+    _cmd_resp_size = 0U;
+    _cmd_resp_index = 0U;
+    rt_mutex_release(&_mutex_cmd);
+    return result;
+}
+
+rt_err_t gnss_configure_all(void)
+{
+    char response[GNSS_CFG_RESP_MAX_SZ];
+    rt_err_t result = -RT_ERROR;
+
+    if (!_inited)
+    {
+        return -RT_ERROR;
+    }
+    _configured = RT_FALSE;
+
+    for (rt_size_t i = 0U;
+         i < (sizeof(_gnss_cfg_bodies) / sizeof(_gnss_cfg_bodies[0])); i++)
+    {
+        result = -RT_ERROR;
+        for (rt_uint8_t attempt = 0U; attempt < GNSS_CFG_RETRY_COUNT; attempt++)
+        {
+            result = gnss_exec_body(_gnss_cfg_bodies[i], response,
+                                    sizeof(response), GNSS_CFG_TIMEOUT_MS);
+            if (result == RT_EOK)
+            {
+                break;
+            }
+            rt_thread_mdelay(150U);
+        }
+        if (result != RT_EOK)
+        {
+            LOG_E("UM220 config failed: %s (%d)", _gnss_cfg_bodies[i], result);
+            return result;
+        }
+        LOG_I("UM220 config OK: %s", _gnss_cfg_bodies[i]);
+
+        /* Constellation switching may briefly reconfigure the navigation engine. */
+        rt_thread_mdelay((i == 0U) ? 300U : 60U);
+    }
+
+    _configured = RT_TRUE;
+
+    /* Read back constellation mode for diagnostics. A failed query does not undo
+     * the acknowledged set commands above. */
+    result = gnss_exec_body("CFGSYS", response, sizeof(response), GNSS_CFG_TIMEOUT_MS);
+    if (result == RT_EOK)
+    {
+        LOG_I("UM220 constellation readback: %s", response);
+    }
+    else
+    {
+        LOG_W("UM220 CFGSYS readback unavailable (%d)", result);
+    }
+    LOG_I("UM220 runtime GNSS configuration complete; no CFGSAVE flash write");
+    return RT_EOK;
+}
+
+rt_bool_t gnss_is_configured(void)
+{
+    return _configured;
+}
+
+static void gnss_cfg_thread_entry(void *parameter)
+{
+    (void)parameter;
+
+    /* UM220 requires startup time after power-on/reset before accepting commands. */
+    rt_thread_mdelay(1000U);
+    if (gnss_configure_all() != RT_EOK)
+    {
+        LOG_E("Automatic UM220 constellation configuration failed");
+    }
+}
+
 static rt_err_t gnss_uart_rx_ind(rt_device_t dev, rt_size_t size)
 {
     rt_sem_release(&_sem_rx);
@@ -702,7 +949,14 @@ static void gnss_rx_thread_entry(void *parameter)
                 if (parse_len > 0U)
                 {
                     line_buf[parse_len] = '\0';
-                    nmea_process_sentence(line_buf, parse_len);
+                    if (gnss_line_is_navigation_nmea(line_buf, parse_len))
+                    {
+                        nmea_process_sentence(line_buf, parse_len);
+                    }
+                    else
+                    {
+                        gnss_command_process_line(line_buf, parse_len);
+                    }
                 }
                 line_len = 0U;
                 collecting = 0U;
@@ -772,7 +1026,9 @@ int gnss_init(void)
     rt_memset(&_gnss_data, 0, sizeof(_gnss_data));
     rt_memset(&_gnss_stats, 0, sizeof(_gnss_stats));
     rt_sem_init(&_sem_rx, "sgnss_rx", 0, RT_IPC_FLAG_PRIO);
+    rt_sem_init(&_sem_cmd, "sgnss_cmd", 0, RT_IPC_FLAG_PRIO);
     rt_mutex_init(&_mutex_data, "mgnss_dt", RT_IPC_FLAG_PRIO);
+    rt_mutex_init(&_mutex_cmd, "mgnss_cmd", RT_IPC_FLAG_PRIO);
 
     /* 7. Set receive callback */
     rt_device_set_rx_indicate(_gnss_dev, gnss_uart_rx_ind);
@@ -792,7 +1048,16 @@ int gnss_init(void)
     rt_thread_startup(_rx_thread);
 
     _inited = RT_TRUE;
-    LOG_I("GNSS module ready: %s @ 115200 8N1 with Fixed-point E7 Engine", GNSS_UART_NAME);
+    _cfg_thread = rt_thread_create("gnss_cfg", gnss_cfg_thread_entry, RT_NULL,
+                                   GNSS_CFG_THREAD_STACK_SZ,
+                                   GNSS_CFG_THREAD_PRIO, 10U);
+    if (_cfg_thread == RT_NULL)
+    {
+        LOG_E("Failed to create gnss_cfg thread");
+        return -RT_ERROR;
+    }
+    rt_thread_startup(_cfg_thread);
+    LOG_I("GNSS module ready: %s @ 115200 8N1; constellation config scheduled", GNSS_UART_NAME);
 
     return RT_EOK;
 }
@@ -910,6 +1175,9 @@ static int gnss_status(int argc, char **argv)
 
     rt_kprintf("\r\n================ GNSS Status ================\r\n");
     rt_kprintf(" Port           : %s (PA3-RX, PA4-TX)\r\n", GNSS_UART_NAME);
+    rt_kprintf(" Constellations : GPS+BDS+GAL+SBAS+QZSS (%s)\r\n",
+               gnss_is_configured() ? "CONFIG OK" : "CONFIG PENDING/FAILED");
+    rt_kprintf(" NMEA Output    : GGA+GSA+GSV+RMC @ 1 Hz\r\n");
     rt_kprintf(" Fix Status     : %s\r\n", fixed ? "FIXED (VALID)" : "NO FIX (INVALID)");
     rt_kprintf(" Freshness      : %s (Threshold: 10s)\r\n", fresh ? "FRESH" : "STALE / EXPIRED");
     rt_kprintf(" Fix Quality    : %d (%s)\r\n", data.fix_quality,
@@ -1007,19 +1275,38 @@ MSH_CMD_EXPORT(gnss_baud, set GNSS UART baudrate);
 
 static int gnss_reset(int argc, char **argv)
 {
+    rt_err_t result;
+
     rt_kprintf("Triggering UM220 GNSS hardware reset (PC13 low pulse 100ms)...\r\n");
+    _configured = RT_FALSE;
     hw_reset_rnss(100);
-    rt_kprintf("GNSS reset complete.\r\n");
-    return 0;
+    rt_thread_mdelay(1000U);
+    result = gnss_configure_all();
+    rt_kprintf("GNSS reset and constellation configuration %s.\r\n",
+               (result == RT_EOK) ? "complete" : "failed");
+    return (result == RT_EOK) ? 0 : -1;
 }
 MSH_CMD_EXPORT(gnss_reset, perform hardware reset on GNSS module);
+
+static int gnss_config(int argc, char **argv)
+{
+    rt_err_t result;
+
+    (void)argc;
+    (void)argv;
+    result = gnss_configure_all();
+    rt_kprintf("UM220 all-constellation runtime configuration: %s\r\n",
+               (result == RT_EOK) ? "OK" : "FAILED");
+    return (result == RT_EOK) ? 0 : -1;
+}
+MSH_CMD_EXPORT(gnss_config, enable GPS BDS Galileo SBAS QZSS and required NMEA);
 
 static int gnss_cmd(int argc, char **argv)
 {
     if (argc < 2)
     {
         rt_kprintf("Usage: gnss_cmd <NMEA command string>\r\n");
-        rt_kprintf("Example: gnss_cmd $PCAS03,1,1,1,1,1,1,1,1*02\r\n");
+        rt_kprintf("Example: gnss_cmd $CFGSYS,H11*checksum\r\n");
         return -1;
     }
 

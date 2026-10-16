@@ -1,720 +1,616 @@
-/*
- * Copyright (c) 2026, Antigravity AI pair programming.
- *
- * SPDX-License-Identifier: Apache-2.0
- *
- * Change Logs:
- * Date           Author       Notes
- * 2026-10-14     Stephen      Stage 4: Store & Forward offline persistent queue manager
- */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 #include "store_forward.h"
 #include "app_flash.h"
-#include "ntn_ms150.h"
-#include "task_wdt.h"
+#include "param_manager.h"
 #include <fal.h>
-#include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 
-#define DBG_TAG "app.sf"
+#ifdef DBG_TAG
+#undef DBG_TAG
+#endif
+#define DBG_TAG "app.sfq3"
 #define DBG_LVL DBG_INFO
 #include <rtdbg.h>
 
-#define SF_RECORD_ALIGN(len)    (((len) + 3) & ~3)
-#define SF_HDR_SZ               sizeof(sf_record_hdr_t)
-#define SF_STATUS_OFFSET        12  /* Byte offset of 'status' field in sf_record_hdr_t */
+static const struct fal_partition *s_part;
+static struct rt_mutex s_lock;
+static rt_bool_t s_ready;
+static rt_bool_t s_storage_fault;
+static rt_bool_t s_history_unavailable;
+static rt_uint32_t s_head_slot;
+static rt_uint32_t s_tail_slot;
+static rt_uint32_t s_next_seq = 1U;
+static rt_uint32_t s_total_pushed;
+static rt_uint32_t s_total_pending;
+static rt_uint32_t s_total_accepted;
+static rt_uint32_t s_total_rejected;
+static rt_uint32_t s_used_slots;
+static rt_uint16_t s_sector_pending[SF_TOTAL_SECTORS];
+static rt_uint16_t s_sector_used[SF_TOTAL_SECTORS];
+static rt_uint16_t s_sector_accepted[SF_TOTAL_SECTORS];
+static rt_bool_t s_sector_bad[SF_TOTAL_SECTORS];
 
-static const struct fal_partition *s_sf_part = RT_NULL;
-static struct rt_mutex             s_sf_lock;
-static struct rt_semaphore         s_sf_sem;
-static rt_thread_t                 s_flush_thread = RT_NULL;
-
-static rt_uint16_t s_head_sector = 0;
-static rt_uint16_t s_head_offset = 0;
-static rt_uint16_t s_tail_sector = 0;
-static rt_uint32_t s_next_seq_id = 1;
-
-static rt_uint32_t s_total_pushed    = 0;
-static rt_uint32_t s_total_pending   = 0;
-static rt_uint32_t s_total_confirmed = 0;
-static rt_uint32_t s_total_dropped   = 0;
-static rt_bool_t   s_auto_flush      = RT_TRUE;
-static rt_bool_t   s_sf_init_ok      = RT_FALSE;
-
-/* Fast CRC-16 (CCITT: poly 0x1021, init 0xFFFF) */
-static rt_uint16_t sf_calc_crc(const sf_record_hdr_t *hdr, const rt_uint8_t *payload)
+static rt_uint32_t sf_slot_address(rt_uint32_t slot)
 {
-    rt_uint16_t crc = 0xFFFF;
-    const rt_uint8_t *p_hdr = (const rt_uint8_t *)hdr;
+    rt_uint32_t sector = slot / SF_SLOTS_PER_SECTOR;
+    rt_uint32_t index = slot % SF_SLOTS_PER_SECTOR;
+    return sector * SF_SECTOR_SIZE + index * SF_SLOT_SIZE;
+}
 
-    /* Calculate CRC over immutable fields: magic(2B) + seq_id(4B) + timestamp(4B) + data_len(2B) = 12 bytes */
-    for (int i = 0; i < 12; i++)
+static rt_uint32_t sf_next_slot(rt_uint32_t slot)
+{
+    slot++;
+    return (slot >= SF_TOTAL_SLOTS) ? 0U : slot;
+}
+
+static rt_uint32_t sf_crc_update(rt_uint32_t crc, const rt_uint8_t *data, rt_size_t len)
+{
+    rt_size_t i;
+    for (i = 0U; i < len; i++)
     {
-        crc ^= (rt_uint16_t)p_hdr[i] << 8;
-        for (int j = 0; j < 8; j++)
+        rt_uint8_t bit;
+        crc ^= data[i];
+        for (bit = 0U; bit < 8U; bit++)
         {
-            if (crc & 0x8000)
-            {
-                crc = (crc << 1) ^ 0x1021;
-            }
-            else
-            {
-                crc <<= 1;
-            }
+            crc = (crc & 1U) ? ((crc >> 1) ^ 0xEDB88320UL) : (crc >> 1);
         }
     }
-
-    if (payload && hdr->data_len > 0)
-    {
-        for (int i = 0; i < hdr->data_len; i++)
-        {
-            crc ^= (rt_uint16_t)payload[i] << 8;
-            for (int j = 0; j < 8; j++)
-            {
-                if (crc & 0x8000)
-                {
-                    crc = (crc << 1) ^ 0x1021;
-                }
-                else
-                {
-                    crc <<= 1;
-                }
-            }
-        }
-    }
-
     return crc;
 }
 
-/* Fast startup scan to rebuild in-memory queue state from Flash */
-static void sf_scan_and_recover(void)
+static rt_uint32_t sf_record_crc(const sf_record_hdr_t *hdr, const rt_uint8_t *payload)
 {
-    rt_uint32_t max_seq = 0;
-    rt_int32_t  last_written_sec = -1;
-    rt_uint16_t last_written_off = 0;
-    rt_int32_t  first_pending_sec = -1;
-
-    s_total_pending   = 0;
-    s_total_confirmed = 0;
-
-    sf_record_hdr_t hdr;
-
-    for (rt_uint16_t sec = 0; sec < SF_TOTAL_SECTORS; sec++)
-    {
-        rt_uint32_t sec_base = sec * SF_SECTOR_SIZE;
-        rt_uint16_t off = 0;
-
-        while (off + SF_HDR_SZ <= SF_SECTOR_SIZE)
-        {
-            if (fal_partition_read(s_sf_part, sec_base + off, (rt_uint8_t *)&hdr, SF_HDR_SZ) < 0)
-            {
-                break;
-            }
-
-            if (hdr.magic != SF_RECORD_MAGIC || hdr.data_len == 0 || hdr.data_len > SF_MAX_PAYLOAD_LEN)
-            {
-                /* No more valid records in this sector */
-                break;
-            }
-
-            rt_size_t rec_len = SF_RECORD_ALIGN(SF_HDR_SZ + hdr.data_len);
-            if (off + rec_len > SF_SECTOR_SIZE)
-            {
-                break;
-            }
-
-            /* Record is structural valid */
-            if (hdr.seq_id > max_seq)
-            {
-                max_seq = hdr.seq_id;
-                last_written_sec = sec;
-                last_written_off = off + rec_len;
-            }
-
-            if (hdr.status == SF_STATUS_PENDING)
-            {
-                s_total_pending++;
-                if (first_pending_sec < 0)
-                {
-                    first_pending_sec = sec;
-                }
-            }
-            else if (hdr.status == SF_STATUS_CONFIRMED)
-            {
-                s_total_confirmed++;
-            }
-
-            off += rec_len;
-        }
-    }
-
-    if (last_written_sec >= 0)
-    {
-        s_head_sector = (rt_uint16_t)last_written_sec;
-        s_head_offset = last_written_off;
-        s_next_seq_id = max_seq + 1;
-    }
-    else
-    {
-        s_head_sector = 0;
-        s_head_offset = 0;
-        s_next_seq_id = 1;
-    }
-
-    if (first_pending_sec >= 0)
-    {
-        s_tail_sector = (rt_uint16_t)first_pending_sec;
-    }
-    else
-    {
-        s_tail_sector = s_head_sector;
-    }
-
-    s_total_pushed = s_total_pending + s_total_confirmed;
-
-    LOG_I("Queue recovery complete: HeadSec=%d, HeadOff=%d, TailSec=%d, NextSeq=%d, Pending=%d, Confirmed=%d",
-          s_head_sector, s_head_offset, s_tail_sector, s_next_seq_id, s_total_pending, s_total_confirmed);
+    rt_uint32_t crc = 0xFFFFFFFFUL;
+    crc = sf_crc_update(crc, (const rt_uint8_t *)hdr, offsetof(sf_record_hdr_t, status));
+    crc = sf_crc_update(crc, payload, hdr->data_len);
+    return ~crc;
 }
 
-/* Push a record into Flash */
-rt_err_t store_forward_push(const void *data, rt_size_t len, rt_uint32_t *out_seq)
+static rt_bool_t sf_header_is_structural(const sf_record_hdr_t *hdr)
 {
-    if (!s_sf_init_ok || data == RT_NULL || len == 0 || len > SF_MAX_PAYLOAD_LEN)
+    return (hdr->magic == SF_RECORD_MAGIC &&
+            hdr->format_version == SF_FORMAT_VERSION &&
+            hdr->header_size == sizeof(sf_record_hdr_t) &&
+            hdr->data_len > 0U && hdr->data_len <= SF_MAX_PAYLOAD_LEN &&
+            hdr->commit == SF_COMMIT_VALID &&
+            (hdr->status == SF_STATUS_PENDING || hdr->status == SF_STATUS_ACCEPTED)) ?
+            RT_TRUE : RT_FALSE;
+}
+
+static rt_err_t sf_read_record(rt_uint32_t slot, sf_record_hdr_t *hdr,
+                               rt_uint8_t *payload, rt_size_t payload_size)
+{
+    rt_uint32_t address;
+    int result;
+
+    if (slot >= SF_TOTAL_SLOTS || hdr == RT_NULL || payload == RT_NULL)
     {
         return -RT_EINVAL;
     }
-
-    rt_size_t rec_len = SF_RECORD_ALIGN(SF_HDR_SZ + len);
-    rt_uint8_t *rec_buf = (rt_uint8_t *)rt_malloc(rec_len);
-    if (!rec_buf)
+    address = sf_slot_address(slot);
+    result = fal_partition_read(s_part, address, (rt_uint8_t *)hdr, sizeof(*hdr));
+    if (result < 0)
     {
-        return -RT_ENOMEM;
+        return -RT_EIO;
     }
-
-    rt_mutex_take(&s_sf_lock, RT_WAITING_FOREVER);
-
-    /* Check if current head sector has room */
-    if (s_head_offset + rec_len > SF_SECTOR_SIZE)
+    if (!sf_header_is_structural(hdr))
     {
-        rt_uint16_t next_sec = (s_head_sector + 1) % SF_TOTAL_SECTORS;
+        return -RT_ERROR;
+    }
+    if (payload_size < hdr->data_len)
+    {
+        return -RT_EINVAL;
+    }
+    result = fal_partition_read(s_part, address + sizeof(*hdr), payload, hdr->data_len);
+    if (result < 0)
+    {
+        return -RT_EIO;
+    }
+    return (sf_record_crc(hdr, payload) == hdr->crc32) ? RT_EOK : -RT_ERROR;
+}
 
-        /* Check for circular queue full condition */
-        if (next_sec == s_tail_sector)
+static rt_err_t sf_read_magic(rt_uint32_t slot, rt_uint32_t *magic)
+{
+    int result = fal_partition_read(s_part, sf_slot_address(slot),
+                                    (rt_uint8_t *)magic, sizeof(*magic));
+    return (result < 0) ? -RT_EIO : RT_EOK;
+}
+
+static void sf_mark_io_fault(rt_bool_t history_unavailable)
+{
+    s_storage_fault = RT_TRUE;
+    if (history_unavailable)
+    {
+        s_history_unavailable = RT_TRUE;
+    }
+}
+
+static void sf_scan(void)
+{
+    rt_uint32_t slot;
+    rt_uint32_t max_seq = 0U;
+    rt_uint32_t min_pending_seq = 0xFFFFFFFFUL;
+    rt_uint32_t max_slot = 0U;
+    rt_uint32_t min_pending_slot = 0U;
+    rt_uint8_t payload[SF_MAX_PAYLOAD_LEN];
+
+    rt_memset(s_sector_pending, 0, sizeof(s_sector_pending));
+    rt_memset(s_sector_used, 0, sizeof(s_sector_used));
+    rt_memset(s_sector_accepted, 0, sizeof(s_sector_accepted));
+    rt_memset(s_sector_bad, 0, sizeof(s_sector_bad));
+    s_total_pending = 0U;
+    s_total_accepted = 0U;
+    s_used_slots = 0U;
+
+    for (slot = 0U; slot < SF_TOTAL_SLOTS; slot++)
+    {
+        sf_record_hdr_t hdr;
+        rt_err_t result = sf_read_record(slot, &hdr, payload, sizeof(payload));
+        rt_uint32_t sector = slot / SF_SLOTS_PER_SECTOR;
+        if (result == -RT_EIO)
         {
-            LOG_W("Queue wrapped around! Advancing tail sector to make room for new records.");
-            s_tail_sector = (s_tail_sector + 1) % SF_TOTAL_SECTORS;
-            s_total_dropped++;
+            sf_mark_io_fault(RT_TRUE);
+            s_sector_bad[sector] = RT_TRUE;
+            slot += SF_SLOTS_PER_SECTOR - (slot % SF_SLOTS_PER_SECTOR) - 1U;
+            continue;
         }
-
-        /* Erase the new sector */
-        fal_partition_erase(s_sf_part, next_sec * SF_SECTOR_SIZE, SF_SECTOR_SIZE);
-        s_head_sector = next_sec;
-        s_head_offset = 0;
-    }
-    else if (s_head_offset == 0)
-    {
-        /* Erase brand new head sector */
-        fal_partition_erase(s_sf_part, s_head_sector * SF_SECTOR_SIZE, SF_SECTOR_SIZE);
-    }
-
-    /* Build header */
-    sf_record_hdr_t *hdr = (sf_record_hdr_t *)rec_buf;
-    hdr->magic     = SF_RECORD_MAGIC;
-    hdr->seq_id    = s_next_seq_id++;
-    hdr->timestamp = rt_tick_get();
-    hdr->data_len  = (rt_uint16_t)len;
-    hdr->status    = SF_STATUS_PENDING;
-    hdr->reserved  = 0xFF;
-    hdr->crc16     = sf_calc_crc(hdr, (const rt_uint8_t *)data);
-
-    /* Copy payload and pad trailing bytes with 0xFF */
-    rt_memcpy(rec_buf + SF_HDR_SZ, data, len);
-    for (rt_size_t i = SF_HDR_SZ + len; i < rec_len; i++)
-    {
-        rec_buf[i] = 0xFF;
-    }
-
-    /* Write to Flash */
-    rt_uint32_t flash_addr = s_head_sector * SF_SECTOR_SIZE + s_head_offset;
-    int ret = fal_partition_write(s_sf_part, flash_addr, rec_buf, rec_len);
-    if (ret >= 0)
-    {
-        s_head_offset += (rt_uint16_t)rec_len;
-        s_total_pushed++;
-        s_total_pending++;
-        if (out_seq)
+        if (result != RT_EOK)
         {
-            *out_seq = hdr->seq_id;
+            continue;
         }
-        LOG_D("Pushed record seq=%d, len=%d at sec=%d, off=%d", hdr->seq_id, len, s_head_sector, flash_addr);
+        s_used_slots++;
+        s_sector_used[sector]++;
+        if (hdr.seq_id > max_seq)
+        {
+            max_seq = hdr.seq_id;
+            max_slot = slot;
+        }
+        if (hdr.status == SF_STATUS_PENDING)
+        {
+            s_total_pending++;
+            s_sector_pending[sector]++;
+            if (hdr.seq_id < min_pending_seq)
+            {
+                min_pending_seq = hdr.seq_id;
+                min_pending_slot = slot;
+            }
+        }
+        else
+        {
+            s_total_accepted++;
+            s_sector_accepted[sector]++;
+        }
     }
-    else
+    s_next_seq = (max_seq == 0U) ? 1U : max_seq + 1U;
+    s_head_slot = (max_seq == 0U) ? 0U : sf_next_slot(max_slot);
+    s_tail_slot = (min_pending_seq == 0xFFFFFFFFUL) ? s_head_slot : min_pending_slot;
+    s_total_pushed = s_used_slots;
+    LOG_I("SFQ3 recovered: pending=%u accepted=%u used=%u next=%u",
+          s_total_pending, s_total_accepted, s_used_slots, s_next_seq);
+}
+
+static rt_err_t sf_erase_sector_locked(rt_uint32_t sector)
+{
+    int result;
+    if (sector >= SF_TOTAL_SECTORS || s_sector_pending[sector] != 0U ||
+        s_sector_bad[sector])
     {
-        LOG_E("Failed to write record to Flash (err=%d)", ret);
+        return -RT_EFULL;
     }
-
-    rt_mutex_release(&s_sf_lock);
-    rt_free(rec_buf);
-
-    if (ret >= 0)
+    result = fal_partition_erase(s_part, sector * SF_SECTOR_SIZE, SF_SECTOR_SIZE);
+    if (result < 0)
     {
-        rt_sem_release(&s_sf_sem);
+        s_sector_bad[sector] = RT_TRUE;
+        sf_mark_io_fault(RT_FALSE);
+        return -RT_EIO;
+    }
+    s_used_slots -= s_sector_used[sector];
+    s_total_accepted -= s_sector_accepted[sector];
+    s_sector_used[sector] = 0U;
+    s_sector_accepted[sector] = 0U;
+    return RT_EOK;
+}
+
+static rt_err_t sf_prepare_head_locked(void)
+{
+    rt_uint32_t magic;
+    rt_uint32_t current_sector;
+    rt_uint32_t count;
+
+    if (sf_read_magic(s_head_slot, &magic) != RT_EOK)
+    {
+        sf_mark_io_fault(RT_FALSE);
+        return -RT_EIO;
+    }
+    if (magic == 0xFFFFFFFFUL)
+    {
         return RT_EOK;
     }
-    return -RT_EIO;
+
+    current_sector = s_head_slot / SF_SLOTS_PER_SECTOR;
+    for (count = 0U; count < SF_TOTAL_SECTORS; count++)
+    {
+        rt_uint32_t sector = (current_sector + count) % SF_TOTAL_SECTORS;
+        if (!s_sector_bad[sector] && s_sector_pending[sector] == 0U)
+        {
+            rt_err_t result = sf_erase_sector_locked(sector);
+            if (result == RT_EOK)
+            {
+                s_head_slot = sector * SF_SLOTS_PER_SECTOR;
+                return RT_EOK;
+            }
+            if (result == -RT_EIO)
+            {
+                return result;
+            }
+        }
+    }
+    s_total_rejected++;
+    return -RT_EFULL;
 }
 
-/* Peek the oldest pending record without confirming */
+static rt_err_t sf_find_next_pending_locked(rt_uint32_t start, rt_uint32_t *out_slot)
+{
+    rt_uint32_t count;
+    rt_uint8_t payload[SF_MAX_PAYLOAD_LEN];
+    rt_uint32_t slot = start;
+
+    for (count = 0U; count < SF_TOTAL_SLOTS; count++)
+    {
+        sf_record_hdr_t hdr;
+        rt_err_t result = sf_read_record(slot, &hdr, payload, sizeof(payload));
+        if (result == -RT_EIO)
+        {
+            sf_mark_io_fault(RT_TRUE);
+        }
+        else if (result == RT_EOK && hdr.status == SF_STATUS_PENDING)
+        {
+            *out_slot = slot;
+            return RT_EOK;
+        }
+        slot = sf_next_slot(slot);
+    }
+    return -RT_EEMPTY;
+}
+
+rt_err_t store_forward_push_ex(const void *data, rt_size_t len,
+                               rt_uint32_t endpoint_id,
+                               rt_uint32_t config_revision,
+                               rt_uint32_t *out_seq)
+{
+    rt_uint8_t slot_data[SF_SLOT_SIZE];
+    rt_uint8_t verify[sizeof(sf_record_hdr_t) + SF_MAX_PAYLOAD_LEN];
+    sf_record_hdr_t *hdr = (sf_record_hdr_t *)slot_data;
+    rt_uint32_t address;
+    rt_uint32_t sector;
+    rt_uint8_t commit = SF_COMMIT_VALID;
+    int result;
+
+    if (!s_ready || data == RT_NULL || len == 0U || len > SF_MAX_PAYLOAD_LEN)
+    {
+        return -RT_EINVAL;
+    }
+    rt_mutex_take(&s_lock, RT_WAITING_FOREVER);
+    if (sf_prepare_head_locked() != RT_EOK)
+    {
+        rt_mutex_release(&s_lock);
+        return s_storage_fault ? -RT_EIO : -RT_EFULL;
+    }
+
+    rt_memset(slot_data, 0xFF, sizeof(slot_data));
+    hdr->magic = SF_RECORD_MAGIC;
+    hdr->format_version = SF_FORMAT_VERSION;
+    hdr->header_size = sizeof(*hdr);
+    hdr->seq_id = s_next_seq;
+    hdr->timestamp = rt_tick_get();
+    hdr->endpoint_id = endpoint_id;
+    hdr->config_revision = config_revision;
+    hdr->data_len = (rt_uint16_t)len;
+    hdr->status = SF_STATUS_PENDING;
+    hdr->commit = 0xFFU;
+    rt_memcpy(slot_data + sizeof(*hdr), data, len);
+    hdr->crc32 = sf_record_crc(hdr, slot_data + sizeof(*hdr));
+    address = sf_slot_address(s_head_slot);
+    result = fal_partition_write(s_part, address, slot_data, sizeof(*hdr) + len);
+    if (result >= 0)
+    {
+        result = fal_partition_read(s_part, address, verify, sizeof(*hdr) + len);
+    }
+    if (result < 0 || rt_memcmp(verify, slot_data, sizeof(*hdr) + len) != 0)
+    {
+        s_sector_bad[s_head_slot / SF_SLOTS_PER_SECTOR] = RT_TRUE;
+        sf_mark_io_fault(RT_FALSE);
+        rt_mutex_release(&s_lock);
+        return -RT_EIO;
+    }
+    result = fal_partition_write(s_part, address + offsetof(sf_record_hdr_t, commit),
+                                 &commit, sizeof(commit));
+    if (result < 0 ||
+        fal_partition_read(s_part, address + offsetof(sf_record_hdr_t, commit),
+                           &verify[0], 1U) < 0 || verify[0] != SF_COMMIT_VALID)
+    {
+        s_sector_bad[s_head_slot / SF_SLOTS_PER_SECTOR] = RT_TRUE;
+        sf_mark_io_fault(RT_FALSE);
+        rt_mutex_release(&s_lock);
+        return -RT_EIO;
+    }
+
+    sector = s_head_slot / SF_SLOTS_PER_SECTOR;
+    if (s_total_pending == 0U)
+    {
+        s_tail_slot = s_head_slot;
+    }
+    s_sector_pending[sector]++;
+    s_sector_used[sector]++;
+    s_total_pending++;
+    s_used_slots++;
+    s_total_pushed++;
+    if (out_seq != RT_NULL)
+    {
+        *out_seq = s_next_seq;
+    }
+    s_next_seq++;
+    s_head_slot = sf_next_slot(s_head_slot);
+    rt_mutex_release(&s_lock);
+    return RT_EOK;
+}
+
+rt_err_t store_forward_push(const void *data, rt_size_t len, rt_uint32_t *out_seq)
+{
+    param_config_t cfg;
+    param_get_snapshot(&cfg);
+    return store_forward_push_ex(data, len, param_get_endpoint_identity(),
+                                 cfg.revision, out_seq);
+}
+
 rt_err_t store_forward_peek(sf_record_hdr_t *hdr, void *data_buf, rt_size_t buf_sz)
 {
-    if (!s_sf_init_ok || hdr == RT_NULL || data_buf == RT_NULL)
+    rt_err_t result;
+    if (!s_ready || hdr == RT_NULL || data_buf == RT_NULL)
     {
         return -RT_EINVAL;
     }
-
-    rt_mutex_take(&s_sf_lock, RT_WAITING_FOREVER);
-
-    if (s_total_pending == 0)
+    rt_mutex_take(&s_lock, RT_WAITING_FOREVER);
+    if (s_total_pending == 0U)
     {
-        rt_mutex_release(&s_sf_lock);
+        rt_mutex_release(&s_lock);
         return -RT_EEMPTY;
     }
-
-    rt_uint16_t sec = s_tail_sector;
-    rt_bool_t   found = RT_FALSE;
-
-    for (rt_uint16_t count = 0; count < SF_TOTAL_SECTORS; count++)
+    result = sf_read_record(s_tail_slot, hdr, (rt_uint8_t *)data_buf, buf_sz);
+    if (result != RT_EOK || hdr->status != SF_STATUS_PENDING)
     {
-        rt_uint32_t sec_base = sec * SF_SECTOR_SIZE;
-        rt_uint16_t off = 0;
-
-        while (off + SF_HDR_SZ <= SF_SECTOR_SIZE)
+        if (result == -RT_EIO)
         {
-            sf_record_hdr_t cur_hdr;
-            if (fal_partition_read(s_sf_part, sec_base + off, (rt_uint8_t *)&cur_hdr, SF_HDR_SZ) < 0)
-            {
-                break;
-            }
-
-            if (cur_hdr.magic != SF_RECORD_MAGIC || cur_hdr.data_len == 0 || cur_hdr.data_len > SF_MAX_PAYLOAD_LEN)
-            {
-                break;
-            }
-
-            rt_size_t rec_len = SF_RECORD_ALIGN(SF_HDR_SZ + cur_hdr.data_len);
-            if (off + rec_len > SF_SECTOR_SIZE)
-            {
-                break;
-            }
-
-            if (cur_hdr.status == SF_STATUS_PENDING)
-            {
-                /* Read payload and verify CRC */
-                rt_size_t copy_len = (cur_hdr.data_len < buf_sz) ? cur_hdr.data_len : buf_sz;
-                fal_partition_read(s_sf_part, sec_base + off + SF_HDR_SZ, (rt_uint8_t *)data_buf, copy_len);
-
-                rt_uint16_t expected_crc = sf_calc_crc(&cur_hdr, (const rt_uint8_t *)data_buf);
-                if (cur_hdr.crc16 == expected_crc)
-                {
-                    *hdr = cur_hdr;
-                    found = RT_TRUE;
-                    break;
-                }
-                else
-                {
-                    LOG_W("CRC mismatch on record seq=%d! Expected=0x%04X, Read=0x%04X",
-                          cur_hdr.seq_id, cur_hdr.crc16, expected_crc);
-                }
-            }
-
-            off += rec_len;
+            sf_mark_io_fault(RT_TRUE);
         }
-
-        if (found)
+        if (sf_find_next_pending_locked(sf_next_slot(s_tail_slot), &s_tail_slot) == RT_EOK)
         {
-            s_tail_sector = sec;
-            break;
+            result = sf_read_record(s_tail_slot, hdr, (rt_uint8_t *)data_buf, buf_sz);
         }
-
-        if (sec == s_head_sector)
-        {
-            break;
-        }
-        sec = (sec + 1) % SF_TOTAL_SECTORS;
     }
-
-    rt_mutex_release(&s_sf_lock);
-    return found ? RT_EOK : -RT_EEMPTY;
+    rt_mutex_release(&s_lock);
+    return result;
 }
 
-/* Mark a record acknowledged via zero-erase write (0xFF -> 0x00) */
 rt_err_t store_forward_ack(rt_uint32_t seq_id)
 {
-    if (!s_sf_init_ok)
+    sf_record_hdr_t hdr;
+    rt_uint8_t payload[SF_MAX_PAYLOAD_LEN];
+    rt_uint8_t state = SF_STATUS_ACCEPTED;
+    rt_uint8_t verify;
+    rt_uint32_t address;
+    rt_uint32_t sector;
+    rt_err_t result;
+
+    if (!s_ready)
     {
         return -RT_EINVAL;
     }
-
-    rt_mutex_take(&s_sf_lock, RT_WAITING_FOREVER);
-
-    rt_uint16_t sec = s_tail_sector;
-    rt_bool_t   found = RT_FALSE;
-
-    for (rt_uint16_t count = 0; count < SF_TOTAL_SECTORS; count++)
+    rt_mutex_take(&s_lock, RT_WAITING_FOREVER);
+    result = sf_read_record(s_tail_slot, &hdr, payload, sizeof(payload));
+    if (result != RT_EOK || hdr.status != SF_STATUS_PENDING || hdr.seq_id != seq_id)
     {
-        rt_uint32_t sec_base = sec * SF_SECTOR_SIZE;
-        rt_uint16_t off = 0;
-
-        while (off + SF_HDR_SZ <= SF_SECTOR_SIZE)
-        {
-            sf_record_hdr_t cur_hdr;
-            if (fal_partition_read(s_sf_part, sec_base + off, (rt_uint8_t *)&cur_hdr, SF_HDR_SZ) < 0)
-            {
-                break;
-            }
-
-            if (cur_hdr.magic != SF_RECORD_MAGIC || cur_hdr.data_len == 0 || cur_hdr.data_len > SF_MAX_PAYLOAD_LEN)
-            {
-                break;
-            }
-
-            rt_size_t rec_len = SF_RECORD_ALIGN(SF_HDR_SZ + cur_hdr.data_len);
-
-            if (cur_hdr.seq_id == seq_id)
-            {
-                if (cur_hdr.status == SF_STATUS_PENDING)
-                {
-                    /* Perform Zero-Erase write directly to 'status' byte */
-                    rt_uint8_t zero_status = SF_STATUS_CONFIRMED;
-                    rt_uint32_t status_addr = sec_base + off + SF_STATUS_OFFSET;
-
-                    fal_partition_write(s_sf_part, status_addr, &zero_status, 1);
-
-                    if (s_total_pending > 0)
-                    {
-                        s_total_pending--;
-                    }
-                    s_total_confirmed++;
-                    LOG_D("Record seq=%d confirmed in Flash via Zero-Erase at 0x%08X", seq_id, status_addr);
-                }
-                found = RT_TRUE;
-                break;
-            }
-
-            off += rec_len;
-        }
-
-        if (found)
-        {
-            break;
-        }
-
-        if (sec == s_head_sector)
-        {
-            break;
-        }
-        sec = (sec + 1) % SF_TOTAL_SECTORS;
+        rt_mutex_release(&s_lock);
+        return -RT_ERROR;
     }
-
-    rt_mutex_release(&s_sf_lock);
-    return found ? RT_EOK : -RT_ERROR;
+    address = sf_slot_address(s_tail_slot) + offsetof(sf_record_hdr_t, status);
+    if (fal_partition_write(s_part, address, &state, 1U) < 0 ||
+        fal_partition_read(s_part, address, &verify, 1U) < 0 || verify != state)
+    {
+        sf_mark_io_fault(RT_TRUE);
+        rt_mutex_release(&s_lock);
+        return -RT_EIO;
+    }
+    sector = s_tail_slot / SF_SLOTS_PER_SECTOR;
+    s_sector_pending[sector]--;
+    s_sector_accepted[sector]++;
+    s_total_pending--;
+    s_total_accepted++;
+    if (s_total_pending == 0U)
+    {
+        s_tail_slot = s_head_slot;
+    }
+    else
+    {
+        (void)sf_find_next_pending_locked(sf_next_slot(s_tail_slot), &s_tail_slot);
+    }
+    rt_mutex_release(&s_lock);
+    return RT_EOK;
 }
 
-/* Erase entire store_forward partition */
 rt_err_t store_forward_clear(void)
 {
-    if (!s_sf_init_ok)
+    int result;
+    if (!s_ready)
     {
         return -RT_EINVAL;
     }
-
-    LOG_I("Erasing Store & Forward partition (768 KB)...");
-    rt_mutex_take(&s_sf_lock, RT_WAITING_FOREVER);
-
-    fal_partition_erase(s_sf_part, 0, SF_TOTAL_SECTORS * SF_SECTOR_SIZE);
-
-    s_head_sector     = 0;
-    s_head_offset     = 0;
-    s_tail_sector     = 0;
-    s_next_seq_id     = 1;
-    s_total_pushed    = 0;
-    s_total_pending   = 0;
-    s_total_confirmed = 0;
-    s_total_dropped   = 0;
-
-    rt_mutex_release(&s_sf_lock);
-    LOG_I("Store & Forward queue cleared successfully.");
+    rt_mutex_take(&s_lock, RT_WAITING_FOREVER);
+    result = fal_partition_erase(s_part, 0U, SF_TOTAL_SECTORS * SF_SECTOR_SIZE);
+    if (result < 0)
+    {
+        sf_mark_io_fault(RT_TRUE);
+        rt_mutex_release(&s_lock);
+        return -RT_EIO;
+    }
+    rt_memset(s_sector_pending, 0, sizeof(s_sector_pending));
+    rt_memset(s_sector_used, 0, sizeof(s_sector_used));
+    rt_memset(s_sector_accepted, 0, sizeof(s_sector_accepted));
+    rt_memset(s_sector_bad, 0, sizeof(s_sector_bad));
+    s_head_slot = 0U;
+    s_tail_slot = 0U;
+    s_next_seq = 1U;
+    s_total_pushed = 0U;
+    s_total_pending = 0U;
+    s_total_accepted = 0U;
+    s_total_rejected = 0U;
+    s_used_slots = 0U;
+    s_storage_fault = RT_FALSE;
+    s_history_unavailable = RT_FALSE;
+    rt_mutex_release(&s_lock);
     return RT_EOK;
 }
 
 void store_forward_get_stats(sf_stats_t *stats)
 {
-    if (!stats)
+    if (stats == RT_NULL)
     {
         return;
     }
-
-    rt_mutex_take(&s_sf_lock, RT_WAITING_FOREVER);
-    stats->total_pushed       = s_total_pushed;
-    stats->total_pending      = s_total_pending;
-    stats->total_confirmed    = s_total_confirmed;
-    stats->total_dropped      = s_total_dropped;
-    stats->next_seq_id        = s_next_seq_id;
-    stats->head_sector        = s_head_sector;
-    stats->head_offset        = s_head_offset;
-    stats->tail_sector        = s_tail_sector;
-    stats->auto_flush_enabled = s_auto_flush;
-    rt_mutex_release(&s_sf_lock);
-}
-
-void store_forward_trigger_flush(void)
-{
-    rt_sem_release(&s_sf_sem);
-}
-
-void store_forward_set_auto_flush(rt_bool_t enable)
-{
-    s_auto_flush = enable;
-    if (enable)
+    rt_memset(stats, 0, sizeof(*stats));
+    if (!s_ready)
     {
-        rt_sem_release(&s_sf_sem);
+        stats->storage_fault = RT_TRUE;
+        stats->history_unavailable = RT_TRUE;
+        return;
     }
-}
-
-/* Auto-flush background worker thread */
-static void sf_flush_entry(void *param)
-{
-    sf_record_hdr_t hdr;
-    rt_uint8_t payload[SF_MAX_PAYLOAD_LEN + 1];
-    char hex_str[SF_MAX_PAYLOAD_LEN * 2 + 1];
-
-    while (1)
+    rt_mutex_take(&s_lock, RT_WAITING_FOREVER);
+    stats->total_pushed = s_total_pushed;
+    stats->total_pending = s_total_pending;
+    stats->total_confirmed = s_total_accepted;
+    stats->total_rejected = s_total_rejected;
+    stats->next_seq_id = s_next_seq;
+    stats->used_slots = s_used_slots;
     {
-        /* Wait on semaphore with 10-second periodic timeout */
-        rt_sem_take(&s_sf_sem, rt_tick_from_millisecond(10000));
-        task_wdt_heartbeat_by_name("sf_flush");
-
-        if (!s_auto_flush || s_total_pending == 0)
+        rt_uint32_t sector;
+        rt_uint32_t bad_slots = 0U;
+        for (sector = 0U; sector < SF_TOTAL_SECTORS; sector++)
         {
-            continue;
+            if (s_sector_bad[sector]) bad_slots += SF_SLOTS_PER_SECTOR;
         }
-
-        /* Check NTN modem network registration status */
-        ntn_signal_t sig;
-        if (ntn_get_signal(&sig) != RT_EOK ||
-            (sig.reg_status != NTN_REG_HOME && sig.reg_status != NTN_REG_ROAMING))
-        {
-            /* No satellite coverage or not registered yet */
-            continue;
-        }
-
-        LOG_I("NTN satellite link active (Reg=%d, RSSI=%d). Flushing %d pending records...",
-              sig.reg_status, sig.rssi, s_total_pending);
-
-        while (s_total_pending > 0)
-        {
-            rt_err_t res = store_forward_peek(&hdr, payload, sizeof(payload));
-            if (res != RT_EOK)
-            {
-                break;
-            }
-
-            /* Convert binary payload to HEX string for NTN AT command */
-            for (rt_uint16_t i = 0; i < hdr.data_len; i++)
-            {
-                rt_sprintf(&hex_str[i * 2], "%02X", payload[i]);
-            }
-            hex_str[hdr.data_len * 2] = '\0';
-
-            /* Send via MS150 UDP socket */
-            rt_err_t send_res = ntn_send_udp_hex(1, hex_str);
-            if (send_res == RT_EOK)
-            {
-                /* Mark acknowledged via zero-erase write */
-                store_forward_ack(hdr.seq_id);
-                LOG_I("Transmitted & ACKed record [seq=%d, len=%d] successfully.", hdr.seq_id, hdr.data_len);
-                rt_thread_mdelay(200);
-            }
-            else
-            {
-                LOG_W("Failed to transmit record [seq=%d] over NTN (err=%d). Pausing flush.", hdr.seq_id, send_res);
-                break;
-            }
-        }
+        stats->usable_slots = (bad_slots + s_total_pending >= SF_TOTAL_SLOTS) ?
+                              0U : SF_TOTAL_SLOTS - bad_slots - s_total_pending;
     }
+    stats->head_sector = (rt_uint16_t)(s_head_slot / SF_SLOTS_PER_SECTOR);
+    stats->head_slot = (rt_uint16_t)(s_head_slot % SF_SLOTS_PER_SECTOR);
+    stats->tail_sector = (rt_uint16_t)(s_tail_slot / SF_SLOTS_PER_SECTOR);
+    stats->storage_fault = s_storage_fault;
+    stats->history_unavailable = s_history_unavailable;
+    rt_mutex_release(&s_lock);
 }
 
-/* Initialization */
+rt_bool_t store_forward_is_ready(void)
+{
+    return s_ready;
+}
+
 int store_forward_init(void)
 {
-    if (s_sf_init_ok)
+    if (s_ready)
     {
         return RT_EOK;
     }
-
-    /* Ensure external flash & FAL are initialized first */
-    app_flash_init();
-
-    s_sf_part = fal_partition_find(SF_PARTITION_NAME);
-    if (s_sf_part == RT_NULL)
+    if (app_flash_init() != RT_EOK)
     {
-        LOG_E("Partition '%s' not found in FAL table!", SF_PARTITION_NAME);
+        s_storage_fault = RT_TRUE;
+        s_history_unavailable = RT_TRUE;
         return -RT_ERROR;
     }
-
-    rt_mutex_init(&s_sf_lock, "sf_lock", RT_IPC_FLAG_PRIO);
-    rt_sem_init(&s_sf_sem, "sf_sem", 0, RT_IPC_FLAG_PRIO);
-
-    /* Fast recovery scan */
-    sf_scan_and_recover();
-
-    s_flush_thread = rt_thread_create("sf_flush",
-                                      sf_flush_entry,
-                                      RT_NULL,
-                                      2048,
-                                      22,
-                                      20);
-    if (s_flush_thread != RT_NULL)
+    s_part = fal_partition_find(SF_PARTITION_NAME);
+    if (s_part == RT_NULL || s_part->len < SF_TOTAL_SECTORS * SF_SECTOR_SIZE)
     {
-        rt_thread_startup(s_flush_thread);
+        s_storage_fault = RT_TRUE;
+        s_history_unavailable = RT_TRUE;
+        LOG_E("SFQ3 partition unavailable or too small");
+        return -RT_ERROR;
     }
-    else
-    {
-        LOG_E("Failed to create Store & Forward flush thread!");
-    }
-
-    s_sf_init_ok = RT_TRUE;
-    LOG_I("Store & Forward persistent queue ready (Part='%s', Capacity=768 KB)", SF_PARTITION_NAME);
+    rt_mutex_init(&s_lock, "sfq3", RT_IPC_FLAG_PRIO);
+    s_ready = RT_TRUE;
+    sf_scan();
+    LOG_I("SFQ3 ready: %u slots, REJECT_NEW policy", SF_TOTAL_SLOTS);
     return RT_EOK;
 }
-/* Depends on Flash/FAL, parameters and NTN service. */
 INIT_ENV_EXPORT(store_forward_init);
 
-/* MSH Diagnostics */
 static void sf_status(int argc, char **argv)
 {
-    sf_stats_t s;
-    store_forward_get_stats(&s);
-
-    rt_kprintf("\n=========== Store & Forward Offline Queue ===========\n");
-    rt_kprintf(" Partition Name     : %s\n", SF_PARTITION_NAME);
-    rt_kprintf(" Total Size         : %d KB (%d Sectors)\n", (SF_TOTAL_SECTORS * SF_SECTOR_SIZE) / 1024, SF_TOTAL_SECTORS);
-    rt_kprintf(" Head Pointer       : Sector %d, Offset %d\n", s.head_sector, s.head_offset);
-    rt_kprintf(" Tail Pointer       : Sector %d\n", s.tail_sector);
-    rt_kprintf(" Next Sequence ID   : %d\n", s.next_seq_id);
-    rt_kprintf(" Total Pushed       : %d\n", s.total_pushed);
-    rt_kprintf(" Total Pending      : %d (Awaiting Satellite Link)\n", s.total_pending);
-    rt_kprintf(" Total Confirmed    : %d (Zero-Erase ACKed)\n", s.total_confirmed);
-    rt_kprintf(" Total Dropped      : %d (Queue Overflows)\n", s.total_dropped);
-    rt_kprintf(" Auto-Flush Enabled : %s\n", s.auto_flush_enabled ? "YES" : "NO");
-    rt_kprintf("=====================================================\n\n");
+    sf_stats_t stats;
+    RT_UNUSED(argc);
+    RT_UNUSED(argv);
+    store_forward_get_stats(&stats);
+    rt_kprintf("sfq3 pending=%u accepted=%u used=%u usable=%u rejected=%u\n",
+               stats.total_pending, stats.total_confirmed, stats.used_slots,
+               stats.usable_slots, stats.total_rejected);
+    rt_kprintf("sfq3 head=%u/%u tail_sec=%u next=%u fault=%u history_unknown=%u\n",
+               stats.head_sector, stats.head_slot, stats.tail_sector,
+               stats.next_seq_id, stats.storage_fault, stats.history_unavailable);
 }
-MSH_CMD_EXPORT(sf_status, Display Store & Forward queue status and statistics);
+MSH_CMD_EXPORT(sf_status, show V3 Flash store-and-forward queue);
 
 static void sf_push(int argc, char **argv)
 {
-    if (argc < 2)
+    rt_uint32_t seq;
+    rt_err_t result;
+    if (argc != 2)
     {
-        rt_kprintf("Usage: sf_push <message_text>\n");
+        rt_kprintf("Usage: sf_push <text>\n");
         return;
     }
-
-    const char *msg = argv[1];
-    rt_size_t len = rt_strlen(msg);
-    rt_uint32_t seq = 0;
-
-    rt_err_t res = store_forward_push(msg, len, &seq);
-    if (res == RT_EOK)
-    {
-        rt_kprintf("Successfully pushed into offline queue: SeqID=%d, Len=%d\n", seq, len);
-    }
-    else
-    {
-        rt_kprintf("Failed to push message (err=%d)\n", res);
-    }
+    result = store_forward_push(argv[1], rt_strlen(argv[1]), &seq);
+    rt_kprintf("sf_push result=%d seq=%u\n", result,
+               (result == RT_EOK) ? seq : 0U);
 }
-MSH_CMD_EXPORT(sf_push, Push a message into offline persistent queue: sf_push <text>);
+MSH_CMD_EXPORT(sf_push, append one test record to SFQ3);
 
 static void sf_peek(int argc, char **argv)
 {
     sf_record_hdr_t hdr;
-    rt_uint8_t buf[SF_MAX_PAYLOAD_LEN + 1];
-
-    rt_err_t res = store_forward_peek(&hdr, buf, sizeof(buf) - 1);
-    if (res == RT_EOK)
+    rt_uint8_t data[SF_MAX_PAYLOAD_LEN];
+    rt_err_t result;
+    rt_uint16_t i;
+    RT_UNUSED(argc);
+    RT_UNUSED(argv);
+    result = store_forward_peek(&hdr, data, sizeof(data));
+    rt_kprintf("sf_peek result=%d", result);
+    if (result == RT_EOK)
     {
-        buf[hdr.data_len] = '\0';
-        rt_kprintf("Oldest Pending Record:\n");
-        rt_kprintf(" Seq ID    : %d\n", hdr.seq_id);
-        rt_kprintf(" Timestamp : %d ticks\n", hdr.timestamp);
-        rt_kprintf(" Length    : %d bytes\n", hdr.data_len);
-        rt_kprintf(" Status    : 0x%02X (PENDING)\n", hdr.status);
-        rt_kprintf(" CRC16     : 0x%04X\n", hdr.crc16);
-        rt_kprintf(" Data(Str) : %s\n", (char *)buf);
-        rt_kprintf(" Data(Hex) : ");
-        for (int i = 0; i < hdr.data_len; i++)
-        {
-            rt_kprintf("%02X ", buf[i]);
-        }
-        rt_kprintf("\n");
+        rt_kprintf(" seq=%u len=%u endpoint=%08X data=", hdr.seq_id,
+                   hdr.data_len, hdr.endpoint_id);
+        for (i = 0U; i < hdr.data_len; i++) rt_kprintf("%02X", data[i]);
     }
-    else if (res == -RT_EEMPTY)
-    {
-        rt_kprintf("Queue is empty. No pending records.\n");
-    }
-    else
-    {
-        rt_kprintf("Peek failed: err=%d\n", res);
-    }
+    rt_kprintf("\n");
 }
-MSH_CMD_EXPORT(sf_peek, Peek oldest pending record in queue);
+MSH_CMD_EXPORT(sf_peek, show oldest valid pending SFQ3 record);
 
 static void sf_pop(int argc, char **argv)
 {
     sf_record_hdr_t hdr;
-    rt_uint8_t buf[SF_MAX_PAYLOAD_LEN + 1];
-
-    rt_err_t res = store_forward_peek(&hdr, buf, sizeof(buf) - 1);
-    if (res == RT_EOK)
-    {
-        buf[hdr.data_len] = '\0';
-        store_forward_ack(hdr.seq_id);
-        rt_kprintf("Popped & Confirmed Record: SeqID=%d, Data='%s'\n", hdr.seq_id, (char *)buf);
-    }
-    else if (res == -RT_EEMPTY)
-    {
-        rt_kprintf("Queue is empty.\n");
-    }
-    else
-    {
-        rt_kprintf("Pop failed: err=%d\n", res);
-    }
+    rt_uint8_t data[SF_MAX_PAYLOAD_LEN];
+    rt_err_t result;
+    RT_UNUSED(argc);
+    RT_UNUSED(argv);
+    result = store_forward_peek(&hdr, data, sizeof(data));
+    if (result == RT_EOK) result = store_forward_ack(hdr.seq_id);
+    rt_kprintf("sf_pop result=%d\n", result);
 }
-MSH_CMD_EXPORT(sf_pop, Pop and acknowledge oldest pending record in queue);
+MSH_CMD_EXPORT(sf_pop, mark oldest SFQ3 record modem-accepted);
 
 static void sf_clear(int argc, char **argv)
 {
-    store_forward_clear();
+    RT_UNUSED(argc);
+    RT_UNUSED(argv);
+    rt_kprintf("sf_clear result=%d\n", store_forward_clear());
 }
-MSH_CMD_EXPORT(sf_clear, Clear all records in Store & Forward partition);
-
-static void sf_flush(int argc, char **argv)
-{
-    rt_kprintf("Triggering Store & Forward satellite flush...\n");
-    store_forward_trigger_flush();
-}
-MSH_CMD_EXPORT(sf_flush, Trigger immediate flush of pending records over NTN);
-
-static void sf_autoflush(int argc, char **argv)
-{
-    if (argc < 2)
-    {
-        rt_kprintf("Usage: sf_autoflush <1|0>\n");
-        return;
-    }
-
-    int enable = argv[1][0] - '0';
-    store_forward_set_auto_flush(enable ? RT_TRUE : RT_FALSE);
-    rt_kprintf("Auto-flush %s\n", enable ? "ENABLED" : "DISABLED");
-}
-MSH_CMD_EXPORT(sf_autoflush, Enable or disable auto satellite flush: sf_autoflush <1|0>);
+MSH_CMD_EXPORT(sf_clear, erase the V3 business queue from maintenance console);

@@ -19,7 +19,7 @@ extern "C" {
 #endif
 
 #define RS232_UART_NAME         "uart1"         /* HC32F460 USART1: PA0(RX), PA1(TX) */
-#define RS232_DEFAULT_BAUDRATE  BAUD_RATE_19200 /* Default 19200 bps (IR-9680 standard) */
+#define RS232_DEFAULT_BAUDRATE  BAUD_RATE_19200 /* Schema-3 safe default */
 #define RS232_RX_FRAME_MAX_SZ   1024            /* Maximum frame buffer size */
 #define RS232_IDLE_TIMEOUT_MS   20              /* Inter-character idle timeout for framing (ms) */
 
@@ -37,7 +37,7 @@ typedef void (*pc_rs232_rx_handler_t)(const rt_uint8_t *frame, rt_size_t size);
 int pc_rs232_init(void);
 
 /**
- * @brief Register upper-layer frame receive callback
+ * @brief Register upper-layer byte-chunk receive callback
  * @param handler Callback function pointer
  */
 void pc_rs232_set_rx_handler(pc_rs232_rx_handler_t handler);
@@ -68,6 +68,7 @@ rt_err_t pc_rs232_set_baudrate(rt_uint32_t baud_rate);
  * @brief Get current RS232 baudrate
  */
 rt_uint32_t pc_rs232_get_baudrate(void);
+rt_bool_t pc_rs232_is_idle(rt_uint32_t quiet_ms);
 
 /**
  * @brief Enable or disable loopback echo test mode

@@ -9,6 +9,7 @@
  */
 
 #include "pc_rs232.h"
+#include "param_manager.h"
 #include <stdlib.h>
 #include "task_wdt.h"
 
@@ -34,6 +35,27 @@ static volatile rt_uint32_t   _stat_rx_frames   = 0;
 static volatile rt_uint32_t   _stat_rx_bytes    = 0;
 static volatile rt_uint32_t   _stat_tx_frames   = 0;
 static volatile rt_uint32_t   _stat_tx_bytes    = 0;
+static volatile rt_tick_t     _last_activity_tick;
+
+static void rs232_dispatch_chunk(rt_size_t frame_len)
+{
+    if (frame_len == 0U)
+    {
+        return;
+    }
+
+    _stat_rx_frames++;
+    _stat_rx_bytes += frame_len;
+    _last_activity_tick = rt_tick_get();
+    if (_loopback_enabled)
+    {
+        pc_rs232_send(_rx_frame_buf, frame_len);
+    }
+    if (_rx_handler != RT_NULL)
+    {
+        _rx_handler(_rx_frame_buf, frame_len);
+    }
+}
 
 /**
  * @brief Serial RX interrupt indication callback
@@ -79,8 +101,10 @@ static void rs232_rx_thread_entry(void *parameter)
                 }
                 else
                 {
-                    /* Frame buffer overflow protection */
-                    break;
+                    /* Deliver a full chunk and continue; upper layers assemble across callbacks. */
+                    rs232_dispatch_chunk(frame_len);
+                    frame_len = 0U;
+                    _rx_frame_buf[frame_len++] = ch;
                 }
             }
 
@@ -94,22 +118,7 @@ static void rs232_rx_thread_entry(void *parameter)
 
         if (frame_len > 0)
         {
-            _stat_rx_frames++;
-            _stat_rx_bytes += frame_len;
-
-            LOG_D("[RS232] Rx Frame #%u (%d bytes)", _stat_rx_frames, frame_len);
-
-            /* If loopback echo is enabled, send back identical frame to PC */
-            if (_loopback_enabled)
-            {
-                pc_rs232_send(_rx_frame_buf, frame_len);
-            }
-
-            /* Dispatch to upper-layer protocol/application handler */
-            if (_rx_handler != RT_NULL)
-            {
-                _rx_handler(_rx_frame_buf, frame_len);
-            }
+            rs232_dispatch_chunk(frame_len);
         }
     }
 }
@@ -136,8 +145,8 @@ int pc_rs232_init(void)
         return -RT_ERROR;
     }
 
-    /* 2. Configure 19200 8N1 (IR-9680 standard) */
-    cfg.baud_rate = RS232_DEFAULT_BAUDRATE;
+    /* 2. Apply the validated schema-3 saved baudrate, otherwise safe default. */
+    cfg.baud_rate = param_get_rs232_baud();
     cfg.data_bits = DATA_BITS_8;
     cfg.stop_bits = STOP_BITS_1;
     cfg.parity    = PARITY_NONE;
@@ -146,7 +155,8 @@ int pc_rs232_init(void)
         LOG_E("Failed to configure %s parameters", RS232_UART_NAME);
         return -RT_ERROR;
     }
-    _current_baud = RS232_DEFAULT_BAUDRATE;
+    _current_baud = cfg.baud_rate;
+    _last_activity_tick = rt_tick_get();
 
     /* 3. Open device with interrupt RX */
     if (rt_device_open(_serial_dev, RT_DEVICE_OFLAG_RDWR | RT_DEVICE_FLAG_INT_RX) != RT_EOK)
@@ -177,7 +187,8 @@ int pc_rs232_init(void)
     rt_thread_startup(_rx_thread);
 
     _inited = RT_TRUE;
-    LOG_I("PC RS232 ready: 19200/8N1, Idle Timeout: %dms", RS232_IDLE_TIMEOUT_MS);
+    LOG_I("PC RS232 ready: %u/8N1, driver chunk idle: %dms",
+          _current_baud, RS232_IDLE_TIMEOUT_MS);
 
     return RT_EOK;
 }
@@ -208,6 +219,7 @@ rt_size_t pc_rs232_send(const void *buf, rt_size_t len)
         sent = rt_device_write(_serial_dev, 0, buf, len);
         if (sent > 0)
         {
+            _last_activity_tick = rt_tick_get();
             _stat_tx_frames++;
             _stat_tx_bytes += sent;
         }
@@ -260,6 +272,12 @@ rt_err_t pc_rs232_set_baudrate(rt_uint32_t baud_rate)
 rt_uint32_t pc_rs232_get_baudrate(void)
 {
     return _current_baud;
+}
+
+rt_bool_t pc_rs232_is_idle(rt_uint32_t quiet_ms)
+{
+    return ((rt_tick_get() - _last_activity_tick) >=
+            rt_tick_from_millisecond(quiet_ms)) ? RT_TRUE : RT_FALSE;
 }
 
 void pc_rs232_set_loopback(rt_bool_t enable)
