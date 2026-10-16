@@ -146,6 +146,9 @@ void ntn_reset(rt_uint32_t pulse_ms);
  * @return RT_EOK on OK, -RT_ETIMEOUT on timeout, -RT_ERROR on ERROR
  */
 rt_err_t ntn_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz, rt_uint32_t timeout_ms);
+/* Reserved for CTRL2 NTN_REQUEST worker while temporary debug lock is held. */
+rt_err_t ntn_debug_exec_cmd(const char *cmd, char *resp_buf,
+                            rt_size_t buf_sz, rt_uint32_t timeout_ms);
 
 /**
  * @brief Send raw bytes directly to NTN module UART

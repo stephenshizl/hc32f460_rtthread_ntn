@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "mcu_local_cmd.h"
+#include "app_telemetry.h"
 #include "param_manager.h"
 #include "pc_rs232.h"
 #include "raw_uplink.h"
@@ -825,8 +826,9 @@ static rt_bool_t handle_control_session(const char *cmd, char *out,
     {
         param_get_snapshot(&cfg);
         rt_snprintf(out, out_size,
-                    "\r\n+MCUCFG:{\"pc_entry_enabled\":%u}\r\nOK\r\n",
-                    cfg.pc_cfg_enabled);
+                    "\r\n+MCUCFG:{\"pc_entry_enabled\":%u,\"active\":%s}\r\nOK\r\n",
+                    cfg.pc_cfg_enabled,
+                    app_telemetry_pc_config_active() ? "true" : "false");
         return RT_TRUE;
     }
     value = cmd_set_value(cmd, "AT+MCUCFG");
@@ -835,6 +837,10 @@ static rt_bool_t handle_control_session(const char *cmd, char *out,
         if (!parse_u32(value, &enabled) || enabled > 1U)
         {
             cmd_error(out, out_size, 1);
+        }
+        else if (param_get_work_mode() != PARAM_MODE_RAW_UPLINK)
+        {
+            cmd_error(out, out_size, 5);
         }
         else
         {

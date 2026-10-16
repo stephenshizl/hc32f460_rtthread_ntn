@@ -197,7 +197,19 @@ static rt_size_t ntn_uart_write(const void *data, rt_size_t len)
     }
     if (rt_mutex_take(&_mutex_tx, RT_WAITING_FOREVER) == RT_EOK)
     {
-        sent = rt_device_write(_ntn_dev, 0, data, len);
+        rt_tick_t start = rt_tick_get();
+        while (sent < len)
+        {
+            rt_size_t n = rt_device_write(_ntn_dev, 0,
+                                           (const rt_uint8_t *)data + sent,
+                                           len - sent);
+            sent += n;
+            if (n == 0U)
+            {
+                if ((rt_tick_get() - start) >= rt_tick_from_millisecond(5000U)) break;
+                rt_thread_mdelay(1U);
+            }
+        }
         _stats.tx_bytes += sent;
         rt_mutex_release(&_mutex_tx);
     }
@@ -254,13 +266,25 @@ static void at_line_dispatch(const rt_uint8_t *line, rt_size_t line_len)
         return;
     }
 
-    /* Vendor AT command: preserve content and use the MS150-required CR terminator. */
-    if (ntn_uart_write(line, line_len) == line_len && ntn_uart_write("\r", 1U) == 1U)
+    /* Serialize mode-0 PC commands with the Bluetooth debug lock and service. */
+    if (rt_mutex_take(&_mutex_cmd, 0) != RT_EOK)
     {
-        _stats.at_cmds_sent++;
-        _pc_command_active = RT_TRUE;
-        _pc_command_deadline = rt_tick_get() + rt_tick_from_millisecond(60000U);
+        pc_rs232_send_str("\r\n+MCUERROR:6\r\nERROR\r\n");
+        return;
     }
+    if (ntn_debug_lock_is_held() || _pc_command_active)
+    {
+        rt_mutex_release(&_mutex_cmd);
+        pc_rs232_send_str("\r\n+MCUERROR:6\r\nERROR\r\n");
+        return;
+    }
+    _pc_command_active = RT_TRUE;
+    _pc_command_deadline = rt_tick_get() + rt_tick_from_millisecond(60000U);
+    if (ntn_uart_write(line, line_len) == line_len && ntn_uart_write("\r", 1U) == 1U)
+        _stats.at_cmds_sent++;
+    else
+        _pc_command_active = RT_FALSE;
+    rt_mutex_release(&_mutex_cmd);
 }
 
 static void at_line_timeout_entry(void *parameter)
@@ -420,7 +444,8 @@ static void ntn_rx_thread_entry(void *parameter)
             }
 
             /* 1. If bridge mode is active, forward bytes to PC RS232 port */
-            if (_bridge_active && param_get_work_mode() == PARAM_MODE_AT_PASSTHROUGH)
+            if (_bridge_active && param_get_work_mode() == PARAM_MODE_AT_PASSTHROUGH &&
+                !ntn_debug_lock_is_held())
             {
                 pc_rs232_send(rx_buf, read_bytes);
                 _stats.bridge_ntn_to_pc += read_bytes;
@@ -584,7 +609,7 @@ static rt_err_t service_prepare_socket(void)
     if (result != RT_EOK) return result;
     result = service_exec("ATE0", response, sizeof(response), 5000U);
     if (result != RT_EOK) return result;
-    result = service_exec("AT+CMEE=2", response, sizeof(response), 5000U);
+    result = service_exec("AT+CMEE=1", response, sizeof(response), 5000U);
     if (result != RT_EOK) return result;
     result = service_exec("AT+CPIN?", response, sizeof(response), 5000U);
     if (result != RT_EOK || rt_strstr(response, "READY") == RT_NULL)
@@ -897,10 +922,13 @@ static rt_err_t ntn_exec_cmd_locked(const char *cmd, char *resp_buf,
 
     /* Write command */
     rt_size_t len = rt_strlen(cmd);
-    ntn_uart_write(cmd, len);
-    if (len == 0U || cmd[len - 1U] != '\r')
+    if (ntn_uart_write(cmd, len) != len ||
+        (len > 0U && cmd[len - 1U] != '\r' &&
+         ntn_uart_write("\r", 1U) != 1U))
     {
-        ntn_uart_write("\r", 1U);
+        _cmd_waiting = RT_FALSE;
+        _cur_resp_buf = RT_NULL;
+        return -RT_ERROR;
     }
     _stats.at_cmds_sent++;
 
@@ -949,17 +977,21 @@ static rt_err_t ntn_command_recover_locked(void)
     return result;
 }
 
-rt_err_t ntn_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz, rt_uint32_t timeout_ms)
+static rt_err_t ntn_exec_cmd_internal(const char *cmd, char *resp_buf,
+                                       rt_size_t buf_sz, rt_uint32_t timeout_ms,
+                                       rt_bool_t debug_request)
 {
     rt_err_t result;
     rt_uint32_t lock_timeout = timeout_ms + 22000U;
 
-    if (!_inited || !_ntn_dev || !cmd)
-    {
-        return -RT_ERROR;
-    }
+    if (!_inited || !_ntn_dev || !cmd) return -RT_ERROR;
     if (rt_mutex_take(&_mutex_cmd, rt_tick_from_millisecond(lock_timeout)) != RT_EOK)
+        return -RT_EBUSY;
+    /* Re-check under the command mutex, closing the auto-service/debug race. */
+    if ((!debug_request && ntn_debug_lock_is_held()) ||
+        (debug_request && !ntn_debug_lock_is_held()))
     {
+        rt_mutex_release(&_mutex_cmd);
         return -RT_EBUSY;
     }
     if (_cmd_recovery_required)
@@ -973,12 +1005,21 @@ rt_err_t ntn_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz, rt_uint
         _cmd_recovery_required = RT_FALSE;
     }
     result = ntn_exec_cmd_locked(cmd, resp_buf, buf_sz, timeout_ms);
-    if (result == -RT_ETIMEOUT)
-    {
-        _cmd_recovery_required = RT_TRUE;
-    }
+    if (result == -RT_ETIMEOUT) _cmd_recovery_required = RT_TRUE;
     rt_mutex_release(&_mutex_cmd);
     return result;
+}
+
+rt_err_t ntn_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz,
+                      rt_uint32_t timeout_ms)
+{
+    return ntn_exec_cmd_internal(cmd, resp_buf, buf_sz, timeout_ms, RT_FALSE);
+}
+
+rt_err_t ntn_debug_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz,
+                            rt_uint32_t timeout_ms)
+{
+    return ntn_exec_cmd_internal(cmd, resp_buf, buf_sz, timeout_ms, RT_TRUE);
 }
 
 rt_size_t ntn_send_raw(const void *data, rt_size_t len)
@@ -1199,18 +1240,20 @@ rt_bool_t ntn_service_is_send_ready(void)
 
 rt_err_t ntn_debug_lock_acquire(void)
 {
-    rt_tick_t now = rt_tick_get();
-    if (_pc_command_active && (rt_int32_t)(now - _pc_command_deadline) < 0)
+    rt_tick_t now;
+    /* Refuse (rather than steal) an in-flight PC or automatic AT transaction. */
+    if (rt_mutex_take(&_mutex_cmd, 0) != RT_EOK) return -RT_EBUSY;
+    now = rt_tick_get();
+    if ((_pc_command_active &&
+         (rt_int32_t)(now - _pc_command_deadline) < 0) || _cmd_waiting ||
+        _at_line_len != 0U || _at_discarding)
     {
+        rt_mutex_release(&_mutex_cmd);
         return -RT_EBUSY;
     }
-    if (_cmd_waiting && !_debug_locked)
-    {
-        return -RT_EBUSY;
-    }
-    _pc_command_active = RT_FALSE;
     _debug_locked = RT_TRUE;
     _debug_lock_deadline = now + rt_tick_from_millisecond(60000U);
+    rt_mutex_release(&_mutex_cmd);
     return RT_EOK;
 }
 

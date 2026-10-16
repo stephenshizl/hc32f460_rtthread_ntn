@@ -10,5 +10,7 @@
 
 int app_telemetry_init(void);
 void app_telemetry_set_mode(rt_uint8_t mode);
+/* Read-only diagnostic indicator; avoid taking router mutex inside AT callbacks. */
+rt_bool_t app_telemetry_pc_config_active(void);
 
 #endif /* __APP_TELEMETRY_H__ */

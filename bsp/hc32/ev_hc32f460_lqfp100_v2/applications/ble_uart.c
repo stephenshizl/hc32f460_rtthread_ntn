@@ -22,6 +22,11 @@ static rt_device_t s_ble_dev;
 static struct rt_semaphore s_rx_sem;
 static struct rt_mutex s_tx_lock;
 static rt_thread_t s_rx_thread;
+static rt_thread_t s_ntn_thread;
+static struct rt_semaphore s_ntn_sem;
+static volatile rt_bool_t s_ntn_pending;
+static char s_ntn_cmd[CTRL2_MAX_PAYLOAD + 1U];
+static rt_tick_t s_rx_partial_tick;
 static rt_bool_t s_initialized;
 static rt_uint8_t s_rx_stream[CTRL2_RX_BUFFER_SIZE];
 static rt_size_t s_rx_length;
@@ -60,6 +65,25 @@ static rt_err_t ble_rx_ind(rt_device_t dev, rt_size_t size)
     return RT_EOK;
 }
 
+/* Serial drivers are allowed to accept a partial write; never emit a
+ * truncated CTRL2 frame and pretend it was fully sent. */
+static rt_size_t ble_write_all_locked(const rt_uint8_t *buf, rt_size_t len)
+{
+    rt_size_t sent = 0U;
+    rt_tick_t start = rt_tick_get();
+    while (sent < len)
+    {
+        rt_size_t n = rt_device_write(s_ble_dev, 0, buf + sent, len - sent);
+        sent += n;
+        if (n == 0U)
+        {
+            if ((rt_tick_get() - start) >= rt_tick_from_millisecond(5000U)) break;
+            rt_thread_mdelay(1U);
+        }
+    }
+    return sent;
+}
+
 rt_size_t ble_uart_send(const void *buf, rt_size_t len)
 {
     rt_size_t sent = 0U;
@@ -67,7 +91,7 @@ rt_size_t ble_uart_send(const void *buf, rt_size_t len)
         return 0U;
     if (rt_mutex_take(&s_tx_lock, RT_WAITING_FOREVER) == RT_EOK)
     {
-        sent = rt_device_write(s_ble_dev, 0, buf, len);
+        sent = ble_write_all_locked((const rt_uint8_t *)buf, len);
         rt_mutex_release(&s_tx_lock);
     }
     return sent;
@@ -95,7 +119,7 @@ rt_size_t ble_ctrl2_send(rt_uint8_t type, rt_uint16_t request_id,
     crc = ctrl2_crc16(&s_tx_frame[2], 6U + payload_len);
     s_tx_frame[8U + payload_len] = (rt_uint8_t)(crc >> 8);
     s_tx_frame[9U + payload_len] = (rt_uint8_t)crc;
-    sent = rt_device_write(s_ble_dev, 0, s_tx_frame, total);
+    sent = ble_write_all_locked(s_tx_frame, total);
     rt_mutex_release(&s_tx_lock);
     return sent;
 }
@@ -110,6 +134,14 @@ static rt_size_t ctrl2_trim_line(const rt_uint8_t *payload, rt_uint16_t length,
     rt_memcpy(out, payload, len);
     out[len] = '\0';
     return len;
+}
+
+static rt_bool_t ctrl2_is_printable(const rt_uint8_t *payload, rt_size_t len)
+{
+    rt_size_t i;
+    for (i = 0U; i < len; i++)
+        if (payload[i] < 0x20U || payload[i] > 0x7EU) return RT_FALSE;
+    return RT_TRUE;
 }
 
 static void ctrl2_send_text(rt_uint8_t type, rt_uint16_t request_id,
@@ -156,7 +188,14 @@ static void ctrl2_handle_local(rt_uint16_t request_id,
     mcu_cmd_action_t action;
     rt_size_t line_len;
     line_len = ctrl2_trim_line(payload, length, s_command, sizeof(s_command));
-    if (request_id == 0U || line_len == 0U ||
+    /* Local requests MUST be one printable ASCII command terminated by CRLF. */
+    if (length < 2U || payload[length - 2U] != '\r' ||
+        payload[length - 1U] != '\n' ||
+        request_id == 0U || line_len == 0U ||
+        memchr(payload, 0, length) != RT_NULL ||
+        memchr(payload, '\r', length - 2U) != RT_NULL ||
+        memchr(payload, '\n', length - 2U) != RT_NULL ||
+        !ctrl2_is_printable(payload, length - 2U) ||
         !mcu_local_cmd_execute((const rt_uint8_t *)s_command, line_len,
                                s_local_response, sizeof(s_local_response), &action))
     {
@@ -166,6 +205,10 @@ static void ctrl2_handle_local(rt_uint16_t request_id,
     }
     if (action.type == MCU_CMD_ACTION_APPLY_RS232_BAUD)
         ctrl2_apply_baud(request_id, &action);
+    else if (action.type == MCU_CMD_ACTION_ENTER_PC_CONFIG ||
+             action.type == MCU_CMD_ACTION_EXIT_PC_CONFIG)
+        ctrl2_send_text(CTRL2_TYPE_LOCAL_FINAL, request_id,
+                        "\r\n+MCUERROR:5\r\nERROR\r\n");
     else
         ctrl2_send_text(CTRL2_TYPE_LOCAL_FINAL, request_id, s_local_response);
 }
@@ -215,33 +258,63 @@ static void ctrl2_downlink_event(const ntn_downlink_t *downlink)
     }
 }
 
+/* NTN commands run on a separate worker: the CTRL2 RX thread must keep draining
+ * UART4 and feeding the watchdog during a 60-second satellite transaction. */
+static void ctrl2_ntn_worker(void *parameter)
+{
+    RT_UNUSED(parameter);
+    for (;;)
+    {
+        rt_err_t result;
+        char response[96];
+        char final[64];
+        (void)rt_sem_take(&s_ntn_sem, RT_WAITING_FOREVER);
+        if (ntn_debug_lock_acquire() != RT_EOK)
+        {
+            ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, s_ntn_request_id,
+                            "{\"ok\":false,\"error\":6}");
+            s_ntn_pending = RT_FALSE;
+            continue;
+        }
+        s_ntn_request_active = RT_TRUE;
+        result = ntn_debug_exec_cmd(s_ntn_cmd, response, sizeof(response), 60000U);
+        s_ntn_request_active = RT_FALSE;
+        rt_snprintf(final, sizeof(final), "{\"ok\":%s,\"error\":%u}",
+                    result == RT_EOK ? "true" : "false",
+                    result == RT_EOK ? 0U :
+                    (result == -RT_ETIMEOUT ? 12U :
+                     (result == -RT_EBUSY ? 6U : 4U)));
+        ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, s_ntn_request_id, final);
+        s_ntn_pending = RT_FALSE;
+    }
+}
+
 static void ctrl2_handle_ntn(rt_uint16_t request_id,
                              const rt_uint8_t *payload, rt_uint16_t length)
 {
-    rt_size_t command_len;
-    rt_err_t result;
-    char final[64];
-    char response[64];
-    command_len = ctrl2_trim_line(payload, length, s_command, sizeof(s_command));
-    if (request_id == 0U || command_len == 0U)
+    rt_size_t command_len = ctrl2_trim_line(payload, length, s_command,
+                                             sizeof(s_command));
+    if (request_id == 0U || command_len < 2U ||
+        length == 0U || (payload[length - 1U] != '\r' &&
+                         payload[length - 1U] != '\n') ||
+        memchr(payload, 0, length) != RT_NULL ||
+        !ctrl2_is_printable(payload, command_len) ||
+        s_command[0] != 'A' || s_command[1] != 'T')
     {
         ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, request_id,
                         "{\"ok\":false,\"error\":1}");
         return;
     }
-    if (ntn_debug_lock_acquire() != RT_EOK)
+    if (s_ntn_pending)
     {
         ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, request_id,
                         "{\"ok\":false,\"error\":6}");
         return;
     }
+    rt_memcpy(s_ntn_cmd, s_command, command_len + 1U);
     s_ntn_request_id = request_id;
-    s_ntn_request_active = RT_TRUE;
-    result = ntn_exec_cmd(s_command, response, sizeof(response), 60000U);
-    s_ntn_request_active = RT_FALSE;
-    rt_snprintf(final, sizeof(final), "{\"ok\":%s,\"error\":%d}",
-                result == RT_EOK ? "true" : "false", result);
-    ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, request_id, final);
+    s_ntn_pending = RT_TRUE;
+    rt_sem_release(&s_ntn_sem);
 }
 
 static void ctrl2_handle_frame(const rt_uint8_t *frame, rt_uint16_t payload_len)
@@ -325,6 +398,12 @@ static void ble_rx_thread_entry(void *parameter)
         rt_size_t count;
         (void)rt_sem_take(&s_rx_sem, rt_tick_from_millisecond(5000U));
         task_wdt_heartbeat_by_name("ble");
+        if (s_rx_length != 0U &&
+            (rt_tick_get() - s_rx_partial_tick) >= rt_tick_from_millisecond(5000U))
+        {
+            s_rx_length = 0U;
+            s_protocol_errors++;
+        }
         while ((count = rt_device_read(s_ble_dev, 0, chunk, sizeof(chunk))) > 0U)
         {
             if (count > sizeof(s_rx_stream) - s_rx_length)
@@ -336,6 +415,7 @@ static void ble_rx_thread_entry(void *parameter)
             {
                 rt_memcpy(&s_rx_stream[s_rx_length], chunk, count);
                 s_rx_length += count;
+                s_rx_partial_tick = rt_tick_get();
                 ctrl2_parse_stream();
             }
         }
@@ -357,6 +437,7 @@ int ble_uart_init(void)
         rt_device_open(s_ble_dev, RT_DEVICE_OFLAG_RDWR | RT_DEVICE_FLAG_INT_RX) != RT_EOK)
         return -RT_ERROR;
     rt_sem_init(&s_rx_sem, "sctrl2", 0, RT_IPC_FLAG_PRIO);
+    rt_sem_init(&s_ntn_sem, "sbntn", 0, RT_IPC_FLAG_PRIO);
     rt_mutex_init(&s_tx_lock, "mctrl2", RT_IPC_FLAG_PRIO);
     rt_device_set_rx_indicate(s_ble_dev, ble_rx_ind);
     s_initialized = RT_TRUE;
@@ -371,6 +452,10 @@ int ble_uart_init(void)
         return -RT_ERROR;
     }
     rt_thread_startup(s_rx_thread);
+    s_ntn_thread = rt_thread_create("btntn", ctrl2_ntn_worker, RT_NULL,
+                                    3072U, BLE_THREAD_PRIO + 1U, 10U);
+    if (s_ntn_thread == RT_NULL) return -RT_ERROR;
+    rt_thread_startup(s_ntn_thread);
     LOG_I("CTRL2 ready: v2, request-id16, payload<=2048, CRC16/CCITT-FALSE");
     return RT_EOK;
 }

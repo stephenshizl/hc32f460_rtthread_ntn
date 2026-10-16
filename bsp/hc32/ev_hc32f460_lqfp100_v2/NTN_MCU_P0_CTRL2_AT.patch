@@ -1,0 +1,967 @@
+diff --git a/.config b/.config
+index 7af02ca..092a79d 100644
+--- a/.config
++++ b/.config
+@@ -247,7 +247,7 @@ CONFIG_RT_USING_SERIAL=y
+ CONFIG_RT_USING_SERIAL_V1=y
+ # CONFIG_RT_USING_SERIAL_V2 is not set
+ CONFIG_RT_SERIAL_USING_DMA=y
+-CONFIG_RT_SERIAL_RB_BUFSZ=512
++CONFIG_RT_SERIAL_RB_BUFSZ=4096
+ # CONFIG_RT_USING_SERIAL_BYPASS is not set
+ # CONFIG_RT_USING_CAN is not set
+ # CONFIG_RT_USING_ADC is not set
+diff --git a/rtconfig.h b/rtconfig.h
+index e21bb68..4e4de57 100644
+--- a/rtconfig.h
++++ b/rtconfig.h
+@@ -157,7 +157,7 @@
+ #define RT_USING_SERIAL
+ #define RT_USING_SERIAL_V1
+ #define RT_SERIAL_USING_DMA
+-#define RT_SERIAL_RB_BUFSZ 512
++#define RT_SERIAL_RB_BUFSZ 4096
+ #define RT_USING_I2C
+ #define RT_USING_I2C_BITOPS
+ #define RT_USING_SPI
+diff --git a/project.uvprojx b/project.uvprojx
+index eb9fd32..baf1477 100644
+--- a/project.uvprojx
++++ b/project.uvprojx
+@@ -399,6 +399,11 @@
+               <FileType>1</FileType>
+               <FilePath>applications\app_telemetry.c</FilePath>
+             </File>
++            <File>
++              <FileName>pc_maint_core.c</FileName>
++              <FileType>1</FileType>
++              <FilePath>applications\pc_maint_core.c</FilePath>
++            </File>
+             <File>
+               <FileName>ble_uart.c</FileName>
+               <FileType>1</FileType>
+diff --git a/applications/app_telemetry.c b/applications/app_telemetry.c
+index 303096d..00b7a3e 100644
+--- a/applications/app_telemetry.c
++++ b/applications/app_telemetry.c
+@@ -11,6 +11,9 @@
+ #include "ntn_ms150.h"
+ #include "pc_rs232.h"
+ #include "raw_uplink.h"
++#include "mcu_local_cmd.h"
++#include "pc_maint_core.h"
++#include <string.h>
+ #include <stdlib.h>
+ 
+ #ifdef DBG_TAG
+@@ -21,6 +24,77 @@
+ #include <rtdbg.h>
+ 
+ static rt_bool_t s_router_initialized;
++static pc_maint_ctx_t s_pc_maint;
++static struct rt_mutex s_maint_lock;
++static rt_thread_t s_maint_thread;
++
++static rt_uint32_t maint_now_ms(void)
++{
++    return (rt_uint32_t)(((rt_uint64_t)rt_tick_get() * 1000U) / RT_TICK_PER_SECOND);
++}
++
++static rt_bool_t maint_enabled(void)
++{
++    param_config_t cfg;
++    param_get_snapshot(&cfg);
++    return cfg.work_mode == PARAM_MODE_RAW_UPLINK && cfg.pc_cfg_enabled;
++}
++
++static void maint_raw(void *user, const uint8_t *data, size_t len)
++{
++    RT_UNUSED(user);
++    (void)raw_uplink_input(data, (rt_size_t)len);
++}
++
++static void maint_local_command(void *user, const uint8_t *data, size_t len)
++{
++    char response[2048];
++    char final_response[160];
++    mcu_cmd_action_t action;
++    rt_err_t ret;
++    RT_UNUSED(user);
++    if (!mcu_local_cmd_execute(data, (rt_size_t)len, response,
++                               sizeof(response), &action))
++    {
++        pc_rs232_send_str("\r\n+MCUERROR:18\r\nERROR\r\n");
++        return;
++    }
++    pc_rs232_send_str(response);
++    if (action.type != MCU_CMD_ACTION_APPLY_RS232_BAUD) return;
++    /* PENDING is sent at old baud; TX has 500 ms to drain before switching. */
++    rt_thread_mdelay(500U);
++    ret = pc_rs232_set_baudrate(action.value);
++    if (ret == RT_EOK)
++        rt_snprintf(final_response, sizeof(final_response),
++                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"baud\":%u}\r\nOK\r\n",
++                    action.value);
++    else
++    {
++        (void)param_set_rs232_baud(action.previous_value, RT_TRUE);
++        rt_snprintf(final_response, sizeof(final_response),
++                    "\r\n+MCUERROR:3\r\nERROR\r\n");
++    }
++    pc_rs232_send_str(final_response);
++}
++
++static const pc_maint_callbacks_t s_maint_callbacks = {
++    maint_raw, maint_local_command, RT_NULL
++};
++
++static void maint_watch_thread(void *parameter)
++{
++    RT_UNUSED(parameter);
++    for (;;)
++    {
++        rt_thread_mdelay(50U);
++        if (rt_mutex_take(&s_maint_lock, RT_WAITING_FOREVER) == RT_EOK)
++        {
++            pc_maint_poll(&s_pc_maint, maint_now_ms(), maint_enabled(),
++                          &s_maint_callbacks);
++            rt_mutex_release(&s_maint_lock);
++        }
++    }
++}
+ 
+ static void terminal_rs232_rx(const rt_uint8_t *data, rt_size_t len)
+ {
+@@ -36,7 +110,10 @@ static void terminal_rs232_rx(const rt_uint8_t *data, rt_size_t len)
+     }
+     else if (mode == PARAM_MODE_RAW_UPLINK)
+     {
+-        (void)raw_uplink_input(data, len);
++        rt_mutex_take(&s_maint_lock, RT_WAITING_FOREVER);
++        pc_maint_input(&s_pc_maint, data, len, maint_now_ms(),
++                       maint_enabled(), &s_maint_callbacks);
++        rt_mutex_release(&s_maint_lock);
+     }
+ }
+ 
+@@ -46,14 +123,26 @@ int app_telemetry_init(void)
+     {
+         return RT_EOK;
+     }
++    pc_maint_init(&s_pc_maint);
++    rt_mutex_init(&s_maint_lock, "mpc_esc", RT_IPC_FLAG_PRIO);
++    s_maint_thread = rt_thread_create("pcmaint", maint_watch_thread, RT_NULL,
++                                      2048U, 18U, 10U);
++    if (s_maint_thread == RT_NULL) return -RT_ERROR;
++    rt_thread_startup(s_maint_thread);
+     pc_rs232_set_rx_handler(terminal_rs232_rx);
+     ntn_bridge_set(param_get_work_mode() == PARAM_MODE_AT_PASSTHROUGH);
+     s_router_initialized = RT_TRUE;
+-    LOG_I("V3 PC router ready: mode0 AT passthrough, mode1 RAW uplink");
++    LOG_I("V3 PC router: mode0 AT, mode1 RAW with guarded +++ maintenance");
+     return RT_EOK;
+ }
+ INIT_APP_EXPORT(app_telemetry_init);
+ 
++rt_bool_t app_telemetry_pc_config_active(void)
++{
++    return (s_router_initialized && pc_maint_active(&s_pc_maint)) ?
++           RT_TRUE : RT_FALSE;
++}
++
+ void app_telemetry_set_mode(rt_uint8_t mode)
+ {
+     if (param_set_work_mode(mode, RT_TRUE) == RT_EOK)
+diff --git a/applications/app_telemetry.h b/applications/app_telemetry.h
+index 296be1d..a2a71a1 100644
+--- a/applications/app_telemetry.h
++++ b/applications/app_telemetry.h
+@@ -10,5 +10,7 @@
+ 
+ int app_telemetry_init(void);
+ void app_telemetry_set_mode(rt_uint8_t mode);
++/* Read-only diagnostic indicator; avoid taking router mutex inside AT callbacks. */
++rt_bool_t app_telemetry_pc_config_active(void);
+ 
+ #endif /* __APP_TELEMETRY_H__ */
+diff --git a/applications/ble_uart.c b/applications/ble_uart.c
+index 45ecb79..a09ea86 100644
+--- a/applications/ble_uart.c
++++ b/applications/ble_uart.c
+@@ -22,6 +22,11 @@ static rt_device_t s_ble_dev;
+ static struct rt_semaphore s_rx_sem;
+ static struct rt_mutex s_tx_lock;
+ static rt_thread_t s_rx_thread;
++static rt_thread_t s_ntn_thread;
++static struct rt_semaphore s_ntn_sem;
++static volatile rt_bool_t s_ntn_pending;
++static char s_ntn_cmd[CTRL2_MAX_PAYLOAD + 1U];
++static rt_tick_t s_rx_partial_tick;
+ static rt_bool_t s_initialized;
+ static rt_uint8_t s_rx_stream[CTRL2_RX_BUFFER_SIZE];
+ static rt_size_t s_rx_length;
+@@ -60,6 +65,25 @@ static rt_err_t ble_rx_ind(rt_device_t dev, rt_size_t size)
+     return RT_EOK;
+ }
+ 
++/* Serial drivers are allowed to accept a partial write; never emit a
++ * truncated CTRL2 frame and pretend it was fully sent. */
++static rt_size_t ble_write_all_locked(const rt_uint8_t *buf, rt_size_t len)
++{
++    rt_size_t sent = 0U;
++    rt_tick_t start = rt_tick_get();
++    while (sent < len)
++    {
++        rt_size_t n = rt_device_write(s_ble_dev, 0, buf + sent, len - sent);
++        sent += n;
++        if (n == 0U)
++        {
++            if ((rt_tick_get() - start) >= rt_tick_from_millisecond(5000U)) break;
++            rt_thread_mdelay(1U);
++        }
++    }
++    return sent;
++}
++
+ rt_size_t ble_uart_send(const void *buf, rt_size_t len)
+ {
+     rt_size_t sent = 0U;
+@@ -67,7 +91,7 @@ rt_size_t ble_uart_send(const void *buf, rt_size_t len)
+         return 0U;
+     if (rt_mutex_take(&s_tx_lock, RT_WAITING_FOREVER) == RT_EOK)
+     {
+-        sent = rt_device_write(s_ble_dev, 0, buf, len);
++        sent = ble_write_all_locked((const rt_uint8_t *)buf, len);
+         rt_mutex_release(&s_tx_lock);
+     }
+     return sent;
+@@ -95,7 +119,7 @@ rt_size_t ble_ctrl2_send(rt_uint8_t type, rt_uint16_t request_id,
+     crc = ctrl2_crc16(&s_tx_frame[2], 6U + payload_len);
+     s_tx_frame[8U + payload_len] = (rt_uint8_t)(crc >> 8);
+     s_tx_frame[9U + payload_len] = (rt_uint8_t)crc;
+-    sent = rt_device_write(s_ble_dev, 0, s_tx_frame, total);
++    sent = ble_write_all_locked(s_tx_frame, total);
+     rt_mutex_release(&s_tx_lock);
+     return sent;
+ }
+@@ -112,6 +136,14 @@ static rt_size_t ctrl2_trim_line(const rt_uint8_t *payload, rt_uint16_t length,
+     return len;
+ }
+ 
++static rt_bool_t ctrl2_is_printable(const rt_uint8_t *payload, rt_size_t len)
++{
++    rt_size_t i;
++    for (i = 0U; i < len; i++)
++        if (payload[i] < 0x20U || payload[i] > 0x7EU) return RT_FALSE;
++    return RT_TRUE;
++}
++
+ static void ctrl2_send_text(rt_uint8_t type, rt_uint16_t request_id,
+                             const char *text)
+ {
+@@ -156,7 +188,14 @@ static void ctrl2_handle_local(rt_uint16_t request_id,
+     mcu_cmd_action_t action;
+     rt_size_t line_len;
+     line_len = ctrl2_trim_line(payload, length, s_command, sizeof(s_command));
+-    if (request_id == 0U || line_len == 0U ||
++    /* Local requests MUST be one printable ASCII command terminated by CRLF. */
++    if (length < 2U || payload[length - 2U] != '\r' ||
++        payload[length - 1U] != '\n' ||
++        request_id == 0U || line_len == 0U ||
++        memchr(payload, 0, length) != RT_NULL ||
++        memchr(payload, '\r', length - 2U) != RT_NULL ||
++        memchr(payload, '\n', length - 2U) != RT_NULL ||
++        !ctrl2_is_printable(payload, length - 2U) ||
+         !mcu_local_cmd_execute((const rt_uint8_t *)s_command, line_len,
+                                s_local_response, sizeof(s_local_response), &action))
+     {
+@@ -166,6 +205,10 @@ static void ctrl2_handle_local(rt_uint16_t request_id,
+     }
+     if (action.type == MCU_CMD_ACTION_APPLY_RS232_BAUD)
+         ctrl2_apply_baud(request_id, &action);
++    else if (action.type == MCU_CMD_ACTION_ENTER_PC_CONFIG ||
++             action.type == MCU_CMD_ACTION_EXIT_PC_CONFIG)
++        ctrl2_send_text(CTRL2_TYPE_LOCAL_FINAL, request_id,
++                        "\r\n+MCUERROR:5\r\nERROR\r\n");
+     else
+         ctrl2_send_text(CTRL2_TYPE_LOCAL_FINAL, request_id, s_local_response);
+ }
+@@ -215,33 +258,63 @@ static void ctrl2_downlink_event(const ntn_downlink_t *downlink)
+     }
+ }
+ 
++/* NTN commands run on a separate worker: the CTRL2 RX thread must keep draining
++ * UART4 and feeding the watchdog during a 60-second satellite transaction. */
++static void ctrl2_ntn_worker(void *parameter)
++{
++    RT_UNUSED(parameter);
++    for (;;)
++    {
++        rt_err_t result;
++        char response[96];
++        char final[64];
++        (void)rt_sem_take(&s_ntn_sem, RT_WAITING_FOREVER);
++        if (ntn_debug_lock_acquire() != RT_EOK)
++        {
++            ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, s_ntn_request_id,
++                            "{\"ok\":false,\"error\":6}");
++            s_ntn_pending = RT_FALSE;
++            continue;
++        }
++        s_ntn_request_active = RT_TRUE;
++        result = ntn_debug_exec_cmd(s_ntn_cmd, response, sizeof(response), 60000U);
++        s_ntn_request_active = RT_FALSE;
++        rt_snprintf(final, sizeof(final), "{\"ok\":%s,\"error\":%u}",
++                    result == RT_EOK ? "true" : "false",
++                    result == RT_EOK ? 0U :
++                    (result == -RT_ETIMEOUT ? 12U :
++                     (result == -RT_EBUSY ? 6U : 4U)));
++        ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, s_ntn_request_id, final);
++        s_ntn_pending = RT_FALSE;
++    }
++}
++
+ static void ctrl2_handle_ntn(rt_uint16_t request_id,
+                              const rt_uint8_t *payload, rt_uint16_t length)
+ {
+-    rt_size_t command_len;
+-    rt_err_t result;
+-    char final[64];
+-    char response[64];
+-    command_len = ctrl2_trim_line(payload, length, s_command, sizeof(s_command));
+-    if (request_id == 0U || command_len == 0U)
++    rt_size_t command_len = ctrl2_trim_line(payload, length, s_command,
++                                             sizeof(s_command));
++    if (request_id == 0U || command_len < 2U ||
++        length == 0U || (payload[length - 1U] != '\r' &&
++                         payload[length - 1U] != '\n') ||
++        memchr(payload, 0, length) != RT_NULL ||
++        !ctrl2_is_printable(payload, command_len) ||
++        s_command[0] != 'A' || s_command[1] != 'T')
+     {
+         ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, request_id,
+                         "{\"ok\":false,\"error\":1}");
+         return;
+     }
+-    if (ntn_debug_lock_acquire() != RT_EOK)
++    if (s_ntn_pending)
+     {
+         ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, request_id,
+                         "{\"ok\":false,\"error\":6}");
+         return;
+     }
++    rt_memcpy(s_ntn_cmd, s_command, command_len + 1U);
+     s_ntn_request_id = request_id;
+-    s_ntn_request_active = RT_TRUE;
+-    result = ntn_exec_cmd(s_command, response, sizeof(response), 60000U);
+-    s_ntn_request_active = RT_FALSE;
+-    rt_snprintf(final, sizeof(final), "{\"ok\":%s,\"error\":%d}",
+-                result == RT_EOK ? "true" : "false", result);
+-    ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, request_id, final);
++    s_ntn_pending = RT_TRUE;
++    rt_sem_release(&s_ntn_sem);
+ }
+ 
+ static void ctrl2_handle_frame(const rt_uint8_t *frame, rt_uint16_t payload_len)
+@@ -325,6 +398,12 @@ static void ble_rx_thread_entry(void *parameter)
+         rt_size_t count;
+         (void)rt_sem_take(&s_rx_sem, rt_tick_from_millisecond(5000U));
+         task_wdt_heartbeat_by_name("ble");
++        if (s_rx_length != 0U &&
++            (rt_tick_get() - s_rx_partial_tick) >= rt_tick_from_millisecond(5000U))
++        {
++            s_rx_length = 0U;
++            s_protocol_errors++;
++        }
+         while ((count = rt_device_read(s_ble_dev, 0, chunk, sizeof(chunk))) > 0U)
+         {
+             if (count > sizeof(s_rx_stream) - s_rx_length)
+@@ -336,6 +415,7 @@ static void ble_rx_thread_entry(void *parameter)
+             {
+                 rt_memcpy(&s_rx_stream[s_rx_length], chunk, count);
+                 s_rx_length += count;
++                s_rx_partial_tick = rt_tick_get();
+                 ctrl2_parse_stream();
+             }
+         }
+@@ -357,6 +437,7 @@ int ble_uart_init(void)
+         rt_device_open(s_ble_dev, RT_DEVICE_OFLAG_RDWR | RT_DEVICE_FLAG_INT_RX) != RT_EOK)
+         return -RT_ERROR;
+     rt_sem_init(&s_rx_sem, "sctrl2", 0, RT_IPC_FLAG_PRIO);
++    rt_sem_init(&s_ntn_sem, "sbntn", 0, RT_IPC_FLAG_PRIO);
+     rt_mutex_init(&s_tx_lock, "mctrl2", RT_IPC_FLAG_PRIO);
+     rt_device_set_rx_indicate(s_ble_dev, ble_rx_ind);
+     s_initialized = RT_TRUE;
+@@ -371,6 +452,10 @@ int ble_uart_init(void)
+         return -RT_ERROR;
+     }
+     rt_thread_startup(s_rx_thread);
++    s_ntn_thread = rt_thread_create("btntn", ctrl2_ntn_worker, RT_NULL,
++                                    3072U, BLE_THREAD_PRIO + 1U, 10U);
++    if (s_ntn_thread == RT_NULL) return -RT_ERROR;
++    rt_thread_startup(s_ntn_thread);
+     LOG_I("CTRL2 ready: v2, request-id16, payload<=2048, CRC16/CCITT-FALSE");
+     return RT_EOK;
+ }
+diff --git a/applications/mcu_local_cmd.c b/applications/mcu_local_cmd.c
+index e5a9949..bd2a2fb 100644
+--- a/applications/mcu_local_cmd.c
++++ b/applications/mcu_local_cmd.c
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: Apache-2.0 */
+ 
+ #include "mcu_local_cmd.h"
++#include "app_telemetry.h"
+ #include "param_manager.h"
+ #include "pc_rs232.h"
+ #include "raw_uplink.h"
+@@ -825,8 +826,9 @@ static rt_bool_t handle_control_session(const char *cmd, char *out,
+     {
+         param_get_snapshot(&cfg);
+         rt_snprintf(out, out_size,
+-                    "\r\n+MCUCFG:{\"pc_entry_enabled\":%u}\r\nOK\r\n",
+-                    cfg.pc_cfg_enabled);
++                    "\r\n+MCUCFG:{\"pc_entry_enabled\":%u,\"active\":%s}\r\nOK\r\n",
++                    cfg.pc_cfg_enabled,
++                    app_telemetry_pc_config_active() ? "true" : "false");
+         return RT_TRUE;
+     }
+     value = cmd_set_value(cmd, "AT+MCUCFG");
+@@ -836,6 +838,10 @@ static rt_bool_t handle_control_session(const char *cmd, char *out,
+         {
+             cmd_error(out, out_size, 1);
+         }
++        else if (param_get_work_mode() != PARAM_MODE_RAW_UPLINK)
++        {
++            cmd_error(out, out_size, 5);
++        }
+         else
+         {
+             action->type = enabled ? MCU_CMD_ACTION_ENTER_PC_CONFIG :
+diff --git a/applications/ntn_ms150.c b/applications/ntn_ms150.c
+index d777290..0f08407 100644
+--- a/applications/ntn_ms150.c
++++ b/applications/ntn_ms150.c
+@@ -197,7 +197,19 @@ static rt_size_t ntn_uart_write(const void *data, rt_size_t len)
+     }
+     if (rt_mutex_take(&_mutex_tx, RT_WAITING_FOREVER) == RT_EOK)
+     {
+-        sent = rt_device_write(_ntn_dev, 0, data, len);
++        rt_tick_t start = rt_tick_get();
++        while (sent < len)
++        {
++            rt_size_t n = rt_device_write(_ntn_dev, 0,
++                                           (const rt_uint8_t *)data + sent,
++                                           len - sent);
++            sent += n;
++            if (n == 0U)
++            {
++                if ((rt_tick_get() - start) >= rt_tick_from_millisecond(5000U)) break;
++                rt_thread_mdelay(1U);
++            }
++        }
+         _stats.tx_bytes += sent;
+         rt_mutex_release(&_mutex_tx);
+     }
+@@ -254,13 +266,25 @@ static void at_line_dispatch(const rt_uint8_t *line, rt_size_t line_len)
+         return;
+     }
+ 
+-    /* Vendor AT command: preserve content and use the MS150-required CR terminator. */
+-    if (ntn_uart_write(line, line_len) == line_len && ntn_uart_write("\r", 1U) == 1U)
++    /* Serialize mode-0 PC commands with the Bluetooth debug lock and service. */
++    if (rt_mutex_take(&_mutex_cmd, 0) != RT_EOK)
+     {
+-        _stats.at_cmds_sent++;
+-        _pc_command_active = RT_TRUE;
+-        _pc_command_deadline = rt_tick_get() + rt_tick_from_millisecond(60000U);
++        pc_rs232_send_str("\r\n+MCUERROR:6\r\nERROR\r\n");
++        return;
++    }
++    if (ntn_debug_lock_is_held() || _pc_command_active)
++    {
++        rt_mutex_release(&_mutex_cmd);
++        pc_rs232_send_str("\r\n+MCUERROR:6\r\nERROR\r\n");
++        return;
+     }
++    _pc_command_active = RT_TRUE;
++    _pc_command_deadline = rt_tick_get() + rt_tick_from_millisecond(60000U);
++    if (ntn_uart_write(line, line_len) == line_len && ntn_uart_write("\r", 1U) == 1U)
++        _stats.at_cmds_sent++;
++    else
++        _pc_command_active = RT_FALSE;
++    rt_mutex_release(&_mutex_cmd);
+ }
+ 
+ static void at_line_timeout_entry(void *parameter)
+@@ -420,7 +444,8 @@ static void ntn_rx_thread_entry(void *parameter)
+             }
+ 
+             /* 1. If bridge mode is active, forward bytes to PC RS232 port */
+-            if (_bridge_active && param_get_work_mode() == PARAM_MODE_AT_PASSTHROUGH)
++            if (_bridge_active && param_get_work_mode() == PARAM_MODE_AT_PASSTHROUGH &&
++                !ntn_debug_lock_is_held())
+             {
+                 pc_rs232_send(rx_buf, read_bytes);
+                 _stats.bridge_ntn_to_pc += read_bytes;
+@@ -584,7 +609,7 @@ static rt_err_t service_prepare_socket(void)
+     if (result != RT_EOK) return result;
+     result = service_exec("ATE0", response, sizeof(response), 5000U);
+     if (result != RT_EOK) return result;
+-    result = service_exec("AT+CMEE=2", response, sizeof(response), 5000U);
++    result = service_exec("AT+CMEE=1", response, sizeof(response), 5000U);
+     if (result != RT_EOK) return result;
+     result = service_exec("AT+CPIN?", response, sizeof(response), 5000U);
+     if (result != RT_EOK || rt_strstr(response, "READY") == RT_NULL)
+@@ -897,10 +922,13 @@ static rt_err_t ntn_exec_cmd_locked(const char *cmd, char *resp_buf,
+ 
+     /* Write command */
+     rt_size_t len = rt_strlen(cmd);
+-    ntn_uart_write(cmd, len);
+-    if (len == 0U || cmd[len - 1U] != '\r')
++    if (ntn_uart_write(cmd, len) != len ||
++        (len > 0U && cmd[len - 1U] != '\r' &&
++         ntn_uart_write("\r", 1U) != 1U))
+     {
+-        ntn_uart_write("\r", 1U);
++        _cmd_waiting = RT_FALSE;
++        _cur_resp_buf = RT_NULL;
++        return -RT_ERROR;
+     }
+     _stats.at_cmds_sent++;
+ 
+@@ -949,17 +977,21 @@ static rt_err_t ntn_command_recover_locked(void)
+     return result;
+ }
+ 
+-rt_err_t ntn_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz, rt_uint32_t timeout_ms)
++static rt_err_t ntn_exec_cmd_internal(const char *cmd, char *resp_buf,
++                                       rt_size_t buf_sz, rt_uint32_t timeout_ms,
++                                       rt_bool_t debug_request)
+ {
+     rt_err_t result;
+     rt_uint32_t lock_timeout = timeout_ms + 22000U;
+ 
+-    if (!_inited || !_ntn_dev || !cmd)
+-    {
+-        return -RT_ERROR;
+-    }
++    if (!_inited || !_ntn_dev || !cmd) return -RT_ERROR;
+     if (rt_mutex_take(&_mutex_cmd, rt_tick_from_millisecond(lock_timeout)) != RT_EOK)
++        return -RT_EBUSY;
++    /* Re-check under the command mutex, closing the auto-service/debug race. */
++    if ((!debug_request && ntn_debug_lock_is_held()) ||
++        (debug_request && !ntn_debug_lock_is_held()))
+     {
++        rt_mutex_release(&_mutex_cmd);
+         return -RT_EBUSY;
+     }
+     if (_cmd_recovery_required)
+@@ -973,14 +1005,23 @@ rt_err_t ntn_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz, rt_uint
+         _cmd_recovery_required = RT_FALSE;
+     }
+     result = ntn_exec_cmd_locked(cmd, resp_buf, buf_sz, timeout_ms);
+-    if (result == -RT_ETIMEOUT)
+-    {
+-        _cmd_recovery_required = RT_TRUE;
+-    }
++    if (result == -RT_ETIMEOUT) _cmd_recovery_required = RT_TRUE;
+     rt_mutex_release(&_mutex_cmd);
+     return result;
+ }
+ 
++rt_err_t ntn_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz,
++                      rt_uint32_t timeout_ms)
++{
++    return ntn_exec_cmd_internal(cmd, resp_buf, buf_sz, timeout_ms, RT_FALSE);
++}
++
++rt_err_t ntn_debug_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz,
++                            rt_uint32_t timeout_ms)
++{
++    return ntn_exec_cmd_internal(cmd, resp_buf, buf_sz, timeout_ms, RT_TRUE);
++}
++
+ rt_size_t ntn_send_raw(const void *data, rt_size_t len)
+ {
+     return ntn_uart_write(data, len);
+@@ -1199,18 +1240,20 @@ rt_bool_t ntn_service_is_send_ready(void)
+ 
+ rt_err_t ntn_debug_lock_acquire(void)
+ {
+-    rt_tick_t now = rt_tick_get();
+-    if (_pc_command_active && (rt_int32_t)(now - _pc_command_deadline) < 0)
+-    {
++    rt_tick_t now;
++    /* Refuse (rather than steal) an in-flight PC or automatic AT transaction. */
++    if (rt_mutex_take(&_mutex_cmd, 0) != RT_EOK) return -RT_EBUSY;
++    now = rt_tick_get();
++    if ((_pc_command_active &&
++         (rt_int32_t)(now - _pc_command_deadline) < 0) || _cmd_waiting ||
++        _at_line_len != 0U || _at_discarding)
++    {
++        rt_mutex_release(&_mutex_cmd);
+         return -RT_EBUSY;
+     }
+-    if (_cmd_waiting && !_debug_locked)
+-    {
+-        return -RT_EBUSY;
+-    }
+-    _pc_command_active = RT_FALSE;
+     _debug_locked = RT_TRUE;
+     _debug_lock_deadline = now + rt_tick_from_millisecond(60000U);
++    rt_mutex_release(&_mutex_cmd);
+     return RT_EOK;
+ }
+ 
+diff --git a/applications/ntn_ms150.h b/applications/ntn_ms150.h
+index 87c519f..f518fb4 100644
+--- a/applications/ntn_ms150.h
++++ b/applications/ntn_ms150.h
+@@ -146,6 +146,9 @@ void ntn_reset(rt_uint32_t pulse_ms);
+  * @return RT_EOK on OK, -RT_ETIMEOUT on timeout, -RT_ERROR on ERROR
+  */
+ rt_err_t ntn_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz, rt_uint32_t timeout_ms);
++/* Reserved for CTRL2 NTN_REQUEST worker while temporary debug lock is held. */
++rt_err_t ntn_debug_exec_cmd(const char *cmd, char *resp_buf,
++                            rt_size_t buf_sz, rt_uint32_t timeout_ms);
+ 
+ /**
+  * @brief Send raw bytes directly to NTN module UART
+diff --git a/ev_hc32f460_lqfp100_v2/applications/pc_maint_core.c b/applications/pc_maint_core.c
+new file mode 100644
+index 0000000..a6d6107
+--- /dev/null
++++ b/applications/pc_maint_core.c
+@@ -0,0 +1,210 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#include "pc_maint_core.h"
++#include <string.h>
++
++static void replay(pc_maint_ctx_t *ctx, const pc_maint_callbacks_t *cb)
++{
++    if (ctx->length != 0U && cb != NULL && cb->raw != NULL)
++        cb->raw(cb->user, ctx->candidate, ctx->length);
++    ctx->length = 0U;
++    ctx->state = PC_MAINT_RAW;
++}
++
++void pc_maint_init(pc_maint_ctx_t *ctx)
++{
++    memset(ctx, 0, sizeof(*ctx));
++}
++
++void pc_maint_reset(pc_maint_ctx_t *ctx, const pc_maint_callbacks_t *cb,
++                    int replay_candidate)
++{
++    if (ctx->state != PC_MAINT_SESSION &&
++        ctx->state != PC_MAINT_DRAIN && replay_candidate)
++        replay(ctx, cb);
++    ctx->state = PC_MAINT_RAW;
++    ctx->length = 0U;
++    ctx->skip_next_lf = 0U;
++}
++
++int pc_maint_active(const pc_maint_ctx_t *ctx)
++{
++    return ctx->state == PC_MAINT_SESSION || ctx->state == PC_MAINT_DRAIN;
++}
++
++void pc_maint_poll(pc_maint_ctx_t *ctx, uint32_t now_ms, int enabled,
++                   const pc_maint_callbacks_t *cb)
++{
++    if (!enabled)
++    {
++        pc_maint_reset(ctx, cb, 1);
++        return;
++    }
++    if ((ctx->state == PC_MAINT_PLUS1 || ctx->state == PC_MAINT_PLUS2) &&
++        (uint32_t)(now_ms - ctx->stage_ms) > PC_MAINT_PLUS_GAP_MS)
++        replay(ctx, cb);
++    else if (ctx->state == PC_MAINT_POST &&
++             (uint32_t)(now_ms - ctx->stage_ms) >= PC_MAINT_POST_GUARD_MS)
++    {
++        ctx->state = PC_MAINT_CONFIRM;
++        ctx->stage_ms += PC_MAINT_POST_GUARD_MS;
++        if ((uint32_t)(now_ms - ctx->stage_ms) >= PC_MAINT_CONFIRM_MS)
++            replay(ctx, cb);
++    }
++    else if (ctx->state == PC_MAINT_CONFIRM &&
++             (uint32_t)(now_ms - ctx->stage_ms) >= PC_MAINT_CONFIRM_MS)
++        replay(ctx, cb);
++    else if ((ctx->state == PC_MAINT_SESSION ||
++              ctx->state == PC_MAINT_DRAIN) &&
++             (uint32_t)(now_ms - ctx->session_activity_ms) >= PC_MAINT_IDLE_MS)
++    {
++        /* Never replay a partial maintenance command as telemetry. */
++        ctx->state = PC_MAINT_RAW;
++        ctx->length = 0U;
++    }
++}
++
++static void emit_raw(const pc_maint_callbacks_t *cb, const uint8_t *buf, size_t len)
++{
++    if (len != 0U && cb != NULL && cb->raw != NULL)
++        cb->raw(cb->user, buf, len);
++}
++
++void pc_maint_input(pc_maint_ctx_t *ctx, const uint8_t *bytes, size_t len,
++                    uint32_t now_ms, int enabled, const pc_maint_callbacks_t *cb)
++{
++    uint8_t plain[PC_MAINT_CANDIDATE_MAX];
++    size_t plain_len = 0U;
++    size_t i;
++    if (ctx == NULL || bytes == NULL || cb == NULL) return;
++    pc_maint_poll(ctx, now_ms, enabled, cb);
++    for (i = 0U; i < len; i++)
++    {
++        uint8_t ch = bytes[i];
++        int retry = 1;
++        /* The idle frame callback groups bytes: same callback shares timestamp. */
++        while (retry)
++        {
++            retry = 0;
++            if (ctx->skip_next_lf)
++            {
++                ctx->skip_next_lf = 0U;
++                if (ch == '\n') break;
++            }
++            if (!enabled)
++            {
++                plain[plain_len++] = ch;
++            }
++            else if (ctx->state == PC_MAINT_RAW)
++            {
++                if (ch == '+' &&
++                    ((!ctx->ever_received && now_ms >= PC_MAINT_PRE_GUARD_MS) ||
++                     (ctx->ever_received &&
++                      (uint32_t)(now_ms - ctx->last_byte_ms) >= PC_MAINT_PRE_GUARD_MS)))
++                {
++                    emit_raw(cb, plain, plain_len);
++                    plain_len = 0U;
++                    ctx->candidate[0] = ch;
++                    ctx->length = 1U;
++                    ctx->state = PC_MAINT_PLUS1;
++                    ctx->stage_ms = now_ms;
++                }
++                else plain[plain_len++] = ch;
++            }
++            else if (ctx->state == PC_MAINT_PLUS1 || ctx->state == PC_MAINT_PLUS2)
++            {
++                if (ch == '+' &&
++                    (uint32_t)(now_ms - ctx->stage_ms) <= PC_MAINT_PLUS_GAP_MS)
++                {
++                    ctx->candidate[ctx->length++] = ch;
++                    ctx->stage_ms = now_ms;
++                    ctx->state = (ctx->state == PC_MAINT_PLUS1) ? PC_MAINT_PLUS2 : PC_MAINT_POST;
++                }
++                else
++                {
++                    emit_raw(cb, plain, plain_len);
++                    plain_len = 0U;
++                    replay(ctx, cb);
++                    retry = 1; /* reprocess current byte without loss */
++                }
++            }
++            else if (ctx->state == PC_MAINT_POST)
++            {
++                emit_raw(cb, plain, plain_len);
++                plain_len = 0U;
++                replay(ctx, cb); /* any byte before post-guard is ordinary RAW */
++                retry = 1;
++            }
++            else if (ctx->state == PC_MAINT_DRAIN)
++            {
++                ctx->session_activity_ms = now_ms;
++                if (ch == '\r')
++                {
++                    ctx->state = PC_MAINT_SESSION;
++                    ctx->length = 0U;
++                    ctx->skip_next_lf = 1U;
++                }
++            }
++            else if (ctx->state == PC_MAINT_CONFIRM || ctx->state == PC_MAINT_SESSION)
++            {
++                if (ctx->length == ((ctx->state == PC_MAINT_CONFIRM) ?
++                                    PC_MAINT_CANDIDATE_MAX : PC_MAINT_COMMAND_MAX))
++                {
++                    if (ctx->state == PC_MAINT_CONFIRM)
++                        replay(ctx, cb);
++                    else
++                    {
++                        ctx->length = 0U; /* discard overlong local AT, never execute */
++                        ctx->state = PC_MAINT_DRAIN;
++                    }
++                    retry = (ctx->state == PC_MAINT_RAW);
++                }
++                else
++                {
++                    ctx->candidate[ctx->length++] = ch;
++                    if (ctx->state == PC_MAINT_SESSION)
++                        ctx->session_activity_ms = now_ms;
++                    if (ch == '\r')
++                    {
++                        size_t offset = (ctx->state == PC_MAINT_CONFIRM) ? 3U : 0U;
++                        size_t cmd_len = ctx->length - offset - 1U;
++                        if (ctx->state == PC_MAINT_CONFIRM &&
++                            cmd_len == sizeof("AT+MCUCFG=1") - 1U &&
++                            memcmp(ctx->candidate + offset, "AT+MCUCFG=1", cmd_len) == 0)
++                        {
++                            ctx->state = PC_MAINT_SESSION;
++                            ctx->session_activity_ms = now_ms;
++                            if (cb->command != NULL)
++                                cb->command(cb->user, ctx->candidate + offset, cmd_len);
++                            ctx->length = 0U;
++                            ctx->skip_next_lf = 1U;
++                        }
++                        else if (ctx->state == PC_MAINT_CONFIRM)
++                        {
++                            emit_raw(cb, plain, plain_len);
++                            plain_len = 0U;
++                            replay(ctx, cb);
++                        }
++                        else
++                        {
++                            int exit = (cmd_len == sizeof("AT+MCUCFG=0") - 1U &&
++                                        memcmp(ctx->candidate, "AT+MCUCFG=0", cmd_len) == 0);
++                            if (cb->command != NULL)
++                                cb->command(cb->user, ctx->candidate, cmd_len);
++                            ctx->length = 0U;
++                            ctx->skip_next_lf = 1U;
++                            if (exit) ctx->state = PC_MAINT_RAW;
++                        }
++                    }
++                }
++            }
++        }
++        ctx->last_byte_ms = now_ms;
++        ctx->ever_received = 1U;
++        if (plain_len == sizeof(plain))
++        {
++            emit_raw(cb, plain, plain_len);
++            plain_len = 0U;
++        }
++    }
++    emit_raw(cb, plain, plain_len);
++}
+diff --git a/ev_hc32f460_lqfp100_v2/applications/pc_maint_core.h b/applications/pc_maint_core.h
+new file mode 100644
+index 0000000..601739e
+--- /dev/null
++++ b/applications/pc_maint_core.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef PC_MAINT_CORE_H
++#define PC_MAINT_CORE_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/* Hardware-independent V3 guarded escape parser. Times are monotonic milliseconds. */
++#define PC_MAINT_CANDIDATE_MAX 256U
++#define PC_MAINT_COMMAND_MAX 384U
++#define PC_MAINT_PRE_GUARD_MS 1000U
++#define PC_MAINT_POST_GUARD_MS 1000U
++#define PC_MAINT_PLUS_GAP_MS 100U
++#define PC_MAINT_CONFIRM_MS 3000U
++#define PC_MAINT_IDLE_MS 60000U
++
++typedef enum {
++    PC_MAINT_RAW = 0,
++    PC_MAINT_PLUS1,
++    PC_MAINT_PLUS2,
++    PC_MAINT_POST,
++    PC_MAINT_CONFIRM,
++    PC_MAINT_SESSION,
++    PC_MAINT_DRAIN
++} pc_maint_state_t;
++
++typedef void (*pc_maint_raw_cb)(void *user, const uint8_t *bytes, size_t len);
++typedef void (*pc_maint_cmd_cb)(void *user, const uint8_t *line, size_t len);
++
++typedef struct {
++    pc_maint_raw_cb raw;
++    pc_maint_cmd_cb command;
++    void *user;
++} pc_maint_callbacks_t;
++
++typedef struct {
++    pc_maint_state_t state;
++    uint32_t last_byte_ms;
++    uint32_t stage_ms;
++    uint32_t session_activity_ms;
++    uint8_t candidate[PC_MAINT_COMMAND_MAX];
++    size_t length;
++    uint8_t ever_received;
++    uint8_t skip_next_lf;
++} pc_maint_ctx_t;
++
++void pc_maint_init(pc_maint_ctx_t *ctx);
++void pc_maint_poll(pc_maint_ctx_t *ctx, uint32_t now_ms, int enabled,
++                   const pc_maint_callbacks_t *cb);
++void pc_maint_input(pc_maint_ctx_t *ctx, const uint8_t *bytes, size_t len,
++                    uint32_t now_ms, int enabled, const pc_maint_callbacks_t *cb);
++void pc_maint_reset(pc_maint_ctx_t *ctx, const pc_maint_callbacks_t *cb,
++                    int replay_candidate);
++int pc_maint_active(const pc_maint_ctx_t *ctx);
++
++#endif
+diff --git a/ev_hc32f460_lqfp100_v2/tests/test_pc_maint.c b/tests/test_pc_maint.c
+new file mode 100644
+index 0000000..c01a63e
+--- /dev/null
++++ b/tests/test_pc_maint.c
+@@ -0,0 +1,53 @@
++#include "pc_maint_core.h"
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++static unsigned char raw[2048];static size_t rn;static char cmd[30][300];static int cn;
++static void onraw(void *u,const uint8_t *p,size_t n){(void)u; assert(rn+n<=sizeof(raw));memcpy(raw+rn,p,n);rn+=n;}
++static void oncmd(void *u,const uint8_t *p,size_t n){(void)u;assert(cn<30);assert(n<300);memcpy(cmd[cn],p,n);cmd[cn][n]=0;cn++;}
++static const pc_maint_callbacks_t cb={onraw,oncmd,0};
++static void feed(pc_maint_ctx_t *s,const char *p,uint32_t t,int en){pc_maint_input(s,(const uint8_t*)p,strlen(p),t,en,&cb);}
++static void reset(pc_maint_ctx_t *s){pc_maint_init(s);rn=0;cn=0;memset(raw,0,sizeof(raw));memset(cmd,0,sizeof(cmd));}
++int main(void){pc_maint_ctx_t s;reset(&s);
++ /* Guard 1000ms, triple+ <=100ms, post guard, config entered then ordinary AT. */
++ feed(&s,"+",1200,1);feed(&s,"+",1240,1);feed(&s,"+",1290,1);
++ pc_maint_poll(&s,2300,1,&cb);feed(&s,"AT+MCUCFG=1\r\n",2450,1);
++ assert(pc_maint_active(&s)&&cn==1&&!strcmp(cmd[0],"AT+MCUCFG=1")&&rn==0);
++ feed(&s,"AT+MCUVER?\r\n",2480,1);assert(cn==2&&!strcmp(cmd[1],"AT+MCUVER?"));
++ feed(&s,"AT+MCUCFG=0\r\n",2520,1);assert(cn==3&&!pc_maint_active(&s)&&rn==0);
++ feed(&s,"DATA",2530,1);assert(rn==4&&!memcmp(raw,"DATA",4));
++ /* Bad escape suffix must replay exactly once and preserve following bytes. */
++ reset(&s);feed(&s,"RAW",200,1);feed(&s,"+++x",1500,1);
++ assert(rn==7&&!memcmp(raw,"RAW+++x",7));
++ /* Candidate fragmented then incomplete: exact original bytes go to RAW. */
++ reset(&s);feed(&s,"++",1500,1);pc_maint_poll(&s,1700,1,&cb);
++ assert(rn==2&&!memcmp(raw,"++",2));
++ /* Invalid confirm command -> RAW exactly, including CR and LF. */
++ reset(&s);feed(&s,"+++",2000,1);pc_maint_poll(&s,3100,1,&cb);
++ feed(&s,"AT+BAD\r\n",3250,1);assert(cn==0);
++ assert(rn==11&&!memcmp(raw,"+++AT+BAD\r\n",11));
++ /* 3s timeout after 1s post quiet. */
++ reset(&s);feed(&s,"+++",2000,1);pc_maint_poll(&s,6500,1,&cb);
++ assert(rn==3&&!memcmp(raw,"+++",3));
++ /* Disabling entry must never intercept RAW data. */
++ reset(&s);feed(&s,"+++AT+MCUCFG=1\r",2000,0);
++ assert(!pc_maint_active(&s)&&rn==strlen("+++AT+MCUCFG=1\r"));
++ /* 60 second idle expiration discards incomplete control, then resumes RAW. */
++ reset(&s);feed(&s,"+++",2000,1);pc_maint_poll(&s,3000,1,&cb);
++ feed(&s,"AT+MCUCFG=1\r",3200,1);feed(&s,"AT+MCU",3210,1);
++ pc_maint_poll(&s,64000,1,&cb);assert(!pc_maint_active(&s));
++ feed(&s,"test",64030,1);assert(rn==4&&!memcmp(raw,"test",4));
++ /* Embedded binary byte remains unmodified in RAW mode. */
++ reset(&s);{uint8_t p[]={0,0xff,0x0d,0x0a,'+','+'};pc_maint_input(&s,p,sizeof(p),1500,1,&cb);
++ assert(rn==sizeof(p)&&!memcmp(raw,p,sizeof(p)));}
++ /* Must not recognize +++ during first second of boot. */
++ reset(&s);feed(&s,"+++",100,1);assert(rn==3&&!memcmp(raw,"+++",3));
++ /* Hostname-size local AT line is valid after entry (candidate remains capped). */
++ reset(&s);feed(&s,"+++",2000,1);pc_maint_poll(&s,3000,1,&cb);
++ feed(&s,"AT+MCUCFG=1\r",3100,1);
++ {char long_cmd[290];size_t i;memcpy(long_cmd,"AT+MCUHOST=",11);
++ for(i=11;i<270;i++) long_cmd[i]='a';
++ long_cmd[270]='\r';
++ long_cmd[271]=0;
++ feed(&s,long_cmd,3200,1);assert(cn==2&&strlen(cmd[1])==270);}
++ puts("PASS: maintenance guard/confirm/replay/timeout/exit/disabled/binary/long-AT");return 0;}
