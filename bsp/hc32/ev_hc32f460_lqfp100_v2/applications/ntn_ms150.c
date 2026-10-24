@@ -36,7 +36,9 @@
 static rt_device_t              _ntn_dev           = RT_NULL;
 static struct rt_semaphore      _sem_rx;
 static struct rt_semaphore      _sem_resp;
+static struct rt_semaphore      _sem_awake;
 static struct rt_mutex          _mutex_cmd;
+static struct rt_mutex          _mutex_resp;
 static struct rt_mutex          _mutex_tx;
 static struct rt_mutex          _mutex_at_line;
 static rt_thread_t              _rx_thread         = RT_NULL;
@@ -52,6 +54,12 @@ static volatile rt_err_t        _cmd_status        = RT_EOK;
 static char                    *_cur_resp_buf      = RT_NULL;
 static rt_size_t                _cur_resp_sz       = 0;
 static rt_size_t                _cur_resp_idx      = 0;
+static rt_bool_t                _cmd_final_received;
+static rt_bool_t                _cmd_resp_truncated;
+static rt_bool_t                _cmd_expect_reboot;
+static char                     _result_line[64];
+static rt_size_t                _result_line_len;
+static rt_bool_t                _result_line_overflow;
 
 /* V3 mode-0 AT line assembly. Buffer holds content; CR is added on transmit. */
 static rt_uint8_t               _at_line_buf[NTN_AT_LINE_MAX_SZ];
@@ -59,6 +67,8 @@ static rt_size_t                _at_line_len       = 0;
 static rt_bool_t                _at_discarding     = RT_FALSE;
 static rt_bool_t                _at_skip_next_lf   = RT_FALSE;
 static rt_tick_t                _at_line_start_tick;
+static rt_tick_t                _at_last_byte_tick;
+static volatile rt_bool_t       _at_timeout_pending;
 static rt_timer_t               _at_timeout_timer  = RT_NULL;
 static char                     _local_response[2048];
 static struct rt_mutex          _service_lock;
@@ -75,11 +85,11 @@ static rt_size_t                _rx_line_len;
 static rt_bool_t                _rx_query_requested;
 static rt_tick_t                _rx_next_query_tick;
 static rt_tick_t                _ntn_location_last_tick;
-static volatile rt_tick_t       _last_rx_tick;
-static rt_bool_t                _cmd_recovery_required;
+static volatile rt_bool_t       _cmd_recovery_required;
 static volatile rt_bool_t       _debug_locked;
 static volatile rt_tick_t       _debug_lock_deadline;
 static volatile rt_bool_t       _pc_command_active;
+static volatile rt_bool_t       _modem_sleeping;
 static volatile rt_tick_t       _pc_command_deadline;
 static ntn_raw_rx_handler_t     _raw_rx_handler;
 static ntn_downlink_handler_t   _downlink_handler;
@@ -158,6 +168,83 @@ parse_error:
     LOG_W("Invalid +MKRECEIVE line discarded (len=%u)", line_len);
 }
 
+/* Called by the RX thread only; the PC bridge still receives the original bytes. */
+static void ntn_command_receive(const rt_uint8_t *data, rt_size_t length)
+{
+    rt_mutex_take(&_mutex_resp, RT_WAITING_FOREVER);
+    for (rt_size_t i = 0U; i < length; i++)
+    {
+        char ch = (char)data[i];
+        if (_cmd_waiting && _cur_resp_buf != RT_NULL)
+        {
+            if (_cur_resp_idx + 1U < _cur_resp_sz)
+            {
+                _cur_resp_buf[_cur_resp_idx++] = ch;
+                _cur_resp_buf[_cur_resp_idx] = '\0';
+            }
+            else
+            {
+                _cmd_resp_truncated = RT_TRUE;
+            }
+        }
+        if (ch == '\r' || ch == '\n')
+        {
+            rt_bool_t success;
+            rt_bool_t failure;
+            _result_line[_result_line_len] = '\0';
+            if (!_result_line_overflow && rt_strcmp(_result_line, "ENTER DEEPSLEEP") == 0)
+            {
+                _modem_sleeping = RT_TRUE;
+                _pc_command_active = RT_FALSE;
+                LOG_W("MS150 entered DeepSleep; MCU PA15 reads %s",
+                      rt_pin_read(NTN_WAKEUP_PIN) ? "HIGH" : "LOW");
+            }
+            else if (!_result_line_overflow &&
+                     (rt_strcmp(_result_line, "EXIT DEEPSLEEP") == 0 || rt_strcmp(_result_line, "RDY") == 0))
+            {
+                _modem_sleeping = RT_FALSE;
+                _pc_command_active = RT_FALSE;
+                rt_sem_release(&_sem_awake);
+            }
+            success = (!_result_line_overflow &&
+                       rt_strcmp(_result_line, "OK") == 0);
+            failure = ((!_result_line_overflow && rt_strcmp(_result_line, "ERROR") == 0) ||
+                       rt_strncmp(_result_line, "+CME ERROR:", 11U) == 0 ||
+                       rt_strncmp(_result_line, "+CMS ERROR:", 11U) == 0);
+            if (!_result_line_overflow && rt_strcmp(_result_line, "REBOOTING") == 0)
+            {
+                _pc_command_active = RT_FALSE;
+                if (_cmd_expect_reboot) success = RT_TRUE;
+            }
+            if (success || failure)
+            {
+                _pc_command_active = RT_FALSE;
+                /* A late final result is drained, never assigned to a new command. */
+                _cmd_recovery_required = RT_FALSE;
+                if (_cmd_waiting)
+                {
+                    _cmd_status = failure ? -RT_ERROR :
+                                  (_cmd_resp_truncated ? -RT_EFULL : RT_EOK);
+                    _cmd_final_received = RT_TRUE;
+                    _cmd_waiting = RT_FALSE;
+                    rt_sem_release(&_sem_resp);
+                }
+            }
+            _result_line_len = 0U;
+            _result_line_overflow = RT_FALSE;
+        }
+        else if (_result_line_len < sizeof(_result_line) - 1U)
+        {
+            _result_line[_result_line_len++] = ch;
+        }
+        else
+        {
+            _result_line_overflow = RT_TRUE;
+        }
+    }
+    rt_mutex_release(&_mutex_resp);
+}
+
 static void ntn_rx_line_feed(rt_uint8_t ch)
 {
     if (ch == '\r' || ch == '\n')
@@ -166,13 +253,6 @@ static void ntn_rx_line_feed(rt_uint8_t ch)
         {
             _rx_line[_rx_line_len] = '\0';
             ntn_publish_receive_line(_rx_line, _rx_line_len);
-            if (_pc_command_active &&
-                ((rt_strcmp((const char *)_rx_line, "OK") == 0) ||
-                 (rt_strcmp((const char *)_rx_line, "ERROR") == 0) ||
-                 (rt_strncmp((const char *)_rx_line, "+CME ERROR:", 11U) == 0)))
-            {
-                _pc_command_active = RT_FALSE;
-            }
             _rx_line_len = 0U;
         }
         return;
@@ -250,6 +330,23 @@ static void local_action_apply(const mcu_cmd_action_t *action)
     pc_rs232_send_str(final_response);
 }
 
+static void ntn_prepare_pc_uart(void)
+{
+    /* PC is the AT client: wake before its first TX, never replay its command. */
+    hw_ntn_wakeup_set(RT_FALSE);
+    if (_modem_sleeping)
+    {
+        while (rt_sem_trytake(&_sem_awake) == RT_EOK);
+        /* Establish a falling edge even when the cached output was already LOW. */
+        hw_ntn_wakeup_pulse(20U, RT_FALSE);
+        if (_modem_sleeping &&
+            rt_sem_take(&_sem_awake, rt_tick_from_millisecond(3000U)) != RT_EOK)
+        {
+            LOG_W("No wake-ready URC within 3 s; forwarding PC command once");
+        }
+    }
+}
+
 static void at_line_dispatch(const rt_uint8_t *line, rt_size_t line_len)
 {
     mcu_cmd_action_t action;
@@ -272,12 +369,15 @@ static void at_line_dispatch(const rt_uint8_t *line, rt_size_t line_len)
         pc_rs232_send_str("\r\n+MCUERROR:6\r\nERROR\r\n");
         return;
     }
-    if (ntn_debug_lock_is_held() || _pc_command_active)
+    if (ntn_debug_lock_is_held())
     {
         rt_mutex_release(&_mutex_cmd);
         pc_rs232_send_str("\r\n+MCUERROR:6\r\nERROR\r\n");
         return;
     }
+    /* An outstanding PC command reserves against other clients, not against
+     * the same PC sending its own next command or manually retrying. */
+    ntn_prepare_pc_uart();
     _pc_command_active = RT_TRUE;
     _pc_command_deadline = rt_tick_get() + rt_tick_from_millisecond(60000U);
     if (ntn_uart_write(line, line_len) == line_len && ntn_uart_write("\r", 1U) == 1U)
@@ -289,12 +389,22 @@ static void at_line_dispatch(const rt_uint8_t *line, rt_size_t line_len)
 
 static void at_line_timeout_entry(void *parameter)
 {
-    rt_bool_t timed_out = RT_FALSE;
     RT_UNUSED(parameter);
+    /* Hard timer context: defer mutexes and RS232 writes to the RX thread. */
+    _at_timeout_pending = RT_TRUE;
+    rt_sem_release(&_sem_rx);
+}
 
-    if (rt_mutex_take(&_mutex_at_line, 0) == RT_EOK)
+static void at_line_timeout_process(void)
+{
+    rt_bool_t timed_out = RT_FALSE;
+
+    if (!_at_timeout_pending) return;
+    _at_timeout_pending = RT_FALSE;
+    if (rt_mutex_take(&_mutex_at_line, RT_WAITING_FOREVER) == RT_EOK)
     {
-        if (_at_line_len > 0U || _at_discarding)
+        if ((_at_line_len > 0U || _at_discarding) &&
+            (rt_tick_get() - _at_last_byte_tick) >= rt_tick_from_millisecond(NTN_AT_INTERBYTE_MS))
         {
             at_line_reset_locked();
             timed_out = RT_TRUE;
@@ -334,6 +444,7 @@ void ntn_bridge_process_pc_data(const rt_uint8_t *data, rt_size_t len)
         rt_tick_t now = rt_tick_get();
 
         rt_mutex_take(&_mutex_at_line, RT_WAITING_FOREVER);
+        _at_last_byte_tick = now;
 
         if (_at_skip_next_lf)
         {
@@ -422,6 +533,7 @@ static rt_err_t ntn_uart_rx_ind(rt_device_t dev, rt_size_t size)
 static void ntn_rx_thread_entry(void *parameter)
 {
     rt_uint8_t rx_buf[64];
+    RT_UNUSED(parameter);
 
     LOG_I("NTN MS150 receiver thread running...");
 
@@ -430,8 +542,9 @@ static void ntn_rx_thread_entry(void *parameter)
         rt_size_t read_bytes;
         while ((read_bytes = rt_device_read(_ntn_dev, 0, rx_buf, sizeof(rx_buf))) > 0)
         {
+            rt_bool_t command_waiting = _cmd_waiting;
             _stats.rx_bytes += read_bytes;
-            _last_rx_tick = rt_tick_get();
+            ntn_command_receive(rx_buf, read_bytes);
 
             for (rt_size_t i = 0U; i < read_bytes; i++)
             {
@@ -440,7 +553,7 @@ static void ntn_rx_thread_entry(void *parameter)
 
             if (_raw_rx_handler != RT_NULL)
             {
-                _raw_rx_handler(rx_buf, read_bytes, _cmd_waiting);
+                _raw_rx_handler(rx_buf, read_bytes, command_waiting);
             }
 
             /* 1. If bridge mode is active, forward bytes to PC RS232 port */
@@ -451,39 +564,9 @@ static void ntn_rx_thread_entry(void *parameter)
                 _stats.bridge_ntn_to_pc += read_bytes;
             }
 
-            /* 2. If an AT command is synchronously waiting for a response */
-            if (_cmd_waiting && _cur_resp_buf)
-            {
-                for (rt_size_t i = 0; i < read_bytes; i++)
-                {
-                    if (_cur_resp_idx < _cur_resp_sz - 1)
-                    {
-                        _cur_resp_buf[_cur_resp_idx++] = (char)rx_buf[i];
-                        _cur_resp_buf[_cur_resp_idx] = '\0';
-                    }
-                }
-
-                /* Check for completion keywords */
-                if (_cur_resp_idx >= 4)
-                {
-                    /* Search for "OK\r\n" */
-                    if (rt_strstr(_cur_resp_buf, "OK\r\n"))
-                    {
-                        _cmd_status = RT_EOK;
-                        _cmd_waiting = RT_FALSE;
-                        rt_sem_release(&_sem_resp);
-                    }
-                    /* Search for "ERROR\r\n" */
-                    else if (rt_strstr(_cur_resp_buf, "ERROR\r\n") || rt_strstr(_cur_resp_buf, "+CME ERROR:"))
-                    {
-                        _cmd_status = -RT_ERROR;
-                        _cmd_waiting = RT_FALSE;
-                        rt_sem_release(&_sem_resp);
-                    }
-                }
-            }
         }
 
+        at_line_timeout_process();
         rt_sem_take(&_sem_rx, rt_tick_from_millisecond(5000));
         task_wdt_heartbeat_by_name("ntn");
     }
@@ -839,7 +922,9 @@ int ntn_ms150_init(void)
     rt_memset(&_stats, 0, sizeof(_stats));
     rt_sem_init(&_sem_rx, "sntn_rx", 0, RT_IPC_FLAG_PRIO);
     rt_sem_init(&_sem_resp, "sntn_rsp", 0, RT_IPC_FLAG_PRIO);
+    rt_sem_init(&_sem_awake, "sntn_wak", 0, RT_IPC_FLAG_PRIO);
     rt_mutex_init(&_mutex_cmd, "mntn_cmd", RT_IPC_FLAG_PRIO);
+    rt_mutex_init(&_mutex_resp, "mntn_rsp", RT_IPC_FLAG_PRIO);
     rt_mutex_init(&_mutex_tx, "mntn_tx", RT_IPC_FLAG_PRIO);
     rt_mutex_init(&_mutex_at_line, "mat_line", RT_IPC_FLAG_PRIO);
     rt_mutex_init(&_service_lock, "mntn_svc", RT_IPC_FLAG_PRIO);
@@ -893,12 +978,44 @@ INIT_ENV_EXPORT(ntn_ms150_init);
 
 void ntn_power_set(rt_bool_t on)
 {
+    rt_bool_t was_on;
+    if (_inited) rt_mutex_take(&_mutex_cmd, RT_WAITING_FOREVER);
+    was_on = hw_power_ntn_get();
     hw_power_ntn_set(on);
+    if (_inited)
+    {
+        if (!on || !was_on)
+        {
+            rt_mutex_take(&_mutex_resp, RT_WAITING_FOREVER);
+            _cmd_recovery_required = RT_FALSE;
+            _cmd_expect_reboot = RT_FALSE;
+            _pc_command_active = RT_FALSE;
+            _modem_sleeping = RT_FALSE;
+            _result_line_len = 0U;
+            _result_line_overflow = RT_FALSE;
+            rt_mutex_release(&_mutex_resp);
+        }
+        rt_mutex_release(&_mutex_cmd);
+    }
 }
 
 void ntn_reset(rt_uint32_t pulse_ms)
 {
+    if (_inited) rt_mutex_take(&_mutex_cmd, RT_WAITING_FOREVER);
+    hw_ntn_wakeup_set(RT_FALSE);
     hw_reset_ntn(pulse_ms);
+    if (_inited)
+    {
+        rt_mutex_take(&_mutex_resp, RT_WAITING_FOREVER);
+        _cmd_recovery_required = RT_FALSE;
+        _cmd_expect_reboot = RT_FALSE;
+        _pc_command_active = RT_FALSE;
+        _modem_sleeping = RT_FALSE;
+        _result_line_len = 0U;
+        _result_line_overflow = RT_FALSE;
+        rt_mutex_release(&_mutex_resp);
+        rt_mutex_release(&_mutex_cmd);
+    }
 }
 
 static rt_err_t ntn_exec_cmd_locked(const char *cmd, char *resp_buf,
@@ -906,7 +1023,9 @@ static rt_err_t ntn_exec_cmd_locked(const char *cmd, char *resp_buf,
 {
     rt_err_t err = RT_EOK;
 
-    /* Setup response buffer */
+    /* RX and the caller must not access a detached response buffer concurrently. */
+    rt_mutex_take(&_mutex_resp, RT_WAITING_FOREVER);
+    while (rt_sem_trytake(&_sem_resp) == RT_EOK);
     _cur_resp_buf = resp_buf;
     _cur_resp_sz  = buf_sz;
     _cur_resp_idx = 0;
@@ -915,10 +1034,11 @@ static rt_err_t ntn_exec_cmd_locked(const char *cmd, char *resp_buf,
         resp_buf[0] = '\0';
     }
     _cmd_status  = -RT_ETIMEOUT;
+    _cmd_final_received = RT_FALSE;
+    _cmd_resp_truncated = RT_FALSE;
+    _cmd_expect_reboot = (rt_strcmp(cmd, "AT+MKRB") == 0 || rt_strcmp(cmd, "at+mkrb") == 0);
     _cmd_waiting = RT_TRUE;
-
-    /* Flush any pending semaphore releases */
-    while (rt_sem_trytake(&_sem_resp) == RT_EOK);
+    rt_mutex_release(&_mutex_resp);
 
     /* Write command */
     rt_size_t len = rt_strlen(cmd);
@@ -926,14 +1046,19 @@ static rt_err_t ntn_exec_cmd_locked(const char *cmd, char *resp_buf,
         (len > 0U && cmd[len - 1U] != '\r' &&
          ntn_uart_write("\r", 1U) != 1U))
     {
+        rt_mutex_take(&_mutex_resp, RT_WAITING_FOREVER);
         _cmd_waiting = RT_FALSE;
         _cur_resp_buf = RT_NULL;
+        _cmd_recovery_required = RT_TRUE;
+        rt_mutex_release(&_mutex_resp);
         return -RT_ERROR;
     }
     _stats.at_cmds_sent++;
 
     /* Wait for response completion */
-    if (rt_sem_take(&_sem_resp, rt_tick_from_millisecond(timeout_ms)) == RT_EOK)
+    (void)rt_sem_take(&_sem_resp, rt_tick_from_millisecond(timeout_ms));
+    rt_mutex_take(&_mutex_resp, RT_WAITING_FOREVER);
+    if (_cmd_final_received)
     {
         err = _cmd_status;
         if (err == RT_EOK)
@@ -948,23 +1073,31 @@ static rt_err_t ntn_exec_cmd_locked(const char *cmd, char *resp_buf,
     else
     {
         err = -RT_ETIMEOUT;
+        _cmd_recovery_required = RT_TRUE;
         _stats.at_cmds_err++;
     }
 
     _cmd_waiting  = RT_FALSE;
     _cur_resp_buf = RT_NULL;
+    rt_mutex_release(&_mutex_resp);
     return err;
 }
 
 static rt_err_t ntn_command_recover_locked(void)
 {
-    char response[64];
-    rt_err_t result;
+    rt_tick_t deadline = rt_tick_get() + rt_tick_from_millisecond(3000U);
 
-    /* Wait briefly (200ms) for any trailing wake-up banner, then strike immediately while modem is awake */
-    rt_thread_mdelay(200U);
-    result = ntn_exec_cmd_locked("AT", response, sizeof(response), 3000U);
-    return result;
+    /* No new probe may consume the previous command's delayed OK/ERROR. */
+    while (_cmd_recovery_required)
+    {
+        if ((rt_int32_t)(rt_tick_get() - deadline) >= 0)
+        {
+            LOG_W("Previous AT result still unknown; wait for its final response or use ntn_reset");
+            return -RT_ETIMEOUT;
+        }
+        rt_thread_mdelay(20U);
+    }
+    return RT_EOK;
 }
 
 static rt_err_t ntn_exec_cmd_internal(const char *cmd, char *resp_buf,
@@ -974,12 +1107,14 @@ static rt_err_t ntn_exec_cmd_internal(const char *cmd, char *resp_buf,
     rt_err_t result;
     rt_uint32_t lock_timeout = timeout_ms + 22000U;
 
-    if (!_inited || !_ntn_dev || !cmd) return -RT_ERROR;
+    if (resp_buf != RT_NULL && buf_sz > 0U) resp_buf[0] = '\0';
+    if (!_inited || !_ntn_dev || cmd == RT_NULL || cmd[0] == '\0' ||
+        (resp_buf != RT_NULL && buf_sz == 0U) || timeout_ms == 0U) return -RT_EINVAL;
     if (rt_mutex_take(&_mutex_cmd, rt_tick_from_millisecond(lock_timeout)) != RT_EOK)
         return -RT_EBUSY;
     /* Re-check under the command mutex, closing the auto-service/debug race. */
     if ((!debug_request && ntn_debug_lock_is_held()) ||
-        (debug_request && !ntn_debug_lock_is_held()))
+        (debug_request && !ntn_debug_lock_is_held()) || _pc_command_active)
     {
         rt_mutex_release(&_mutex_cmd);
         return -RT_EBUSY;
@@ -992,10 +1127,8 @@ static rt_err_t ntn_exec_cmd_internal(const char *cmd, char *resp_buf,
             rt_mutex_release(&_mutex_cmd);
             return result;
         }
-        _cmd_recovery_required = RT_FALSE;
     }
     result = ntn_exec_cmd_locked(cmd, resp_buf, buf_sz, timeout_ms);
-    if (result == -RT_ETIMEOUT) _cmd_recovery_required = RT_TRUE;
     rt_mutex_release(&_mutex_cmd);
     return result;
 }
@@ -1263,7 +1396,14 @@ rt_bool_t ntn_debug_lock_is_held(void)
     if (_pc_command_active &&
         (rt_int32_t)(rt_tick_get() - _pc_command_deadline) >= 0)
     {
-        _pc_command_active = RT_FALSE;
+        rt_mutex_take(&_mutex_resp, RT_WAITING_FOREVER);
+        if (_pc_command_active)
+        {
+            _pc_command_active = RT_FALSE;
+            /* PC owns response matching and retries. Do not poison the separate
+             * synchronous transaction recovery state when its reservation ends. */
+        }
+        rt_mutex_release(&_mutex_resp);
     }
     return _debug_locked;
 }
@@ -1416,7 +1556,7 @@ MSH_CMD_EXPORT(ntn_status, display MS150 Iridium NTN modem status and signal met
 
 static int ntn_at(int argc, char **argv)
 {
-    char resp[NTN_RESP_BUF_MAX_SZ];
+    char resp[NTN_RESP_BUF_MAX_SZ] = {0};
 
     if (argc < 2)
     {
@@ -1431,14 +1571,6 @@ static int ntn_at(int argc, char **argv)
 
     rt_kprintf("[AT TX] %s\r\n", argv[1]);
     rt_err_t err = ntn_exec_cmd(argv[1], resp, sizeof(resp), 3000);
-    if (err == -RT_ETIMEOUT)
-    {
-        /* If modem was in DeepSleep, first attempt woke it up. Retry immediately while awake! */
-        rt_kprintf("[AT] Modem woke from DeepSleep, retrying immediately...\r\n");
-        rt_thread_mdelay(300);
-        err = ntn_exec_cmd(argv[1], resp, sizeof(resp), 3000);
-    }
-
     if (err == RT_EOK)
     {
         rt_kprintf("[AT RX] (OK):\r\n%s\r\n", resp);
@@ -1446,6 +1578,7 @@ static int ntn_at(int argc, char **argv)
     else if (err == -RT_ETIMEOUT)
     {
         rt_kprintf("[AT RX] (TIMEOUT):\r\n%s\r\n", resp);
+        rt_kprintf("[AT] Result unknown; command was not resent. Wait for the final response or use ntn_reset.\r\n");
     }
     else
     {

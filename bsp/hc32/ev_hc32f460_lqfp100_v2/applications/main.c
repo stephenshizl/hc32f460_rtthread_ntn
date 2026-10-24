@@ -19,14 +19,14 @@
 
 int main(void)
 {
-    char boot_log[128];
+    char boot_log[192];
 
     rt_kprintf("\r\n[SYS] NTN System Main Thread Started...\r\n");
     /* One boot record on the customer port, after the PC router is initialized. */
     rt_snprintf(boot_log, sizeof(boot_log),
-                "\r\n[BOOT] NTN-Terminal started, RS232=%u/8N1, mode=%u, config=%s\r\n",
+                "\r\n[BOOT] NTN-Terminal started, RS232=%u/8N1, mode=%u, config=%s, fw=PC_AT_V2, build=%s %s\r\n",
                 pc_rs232_get_baudrate(), param_get_work_mode(),
-                param_has_persisted_config() ? "saved" : "RAM defaults");
+                param_has_persisted_config() ? "saved" : "RAM defaults", __DATE__, __TIME__);
     pc_rs232_send_str(boot_log);
 
     while (1)

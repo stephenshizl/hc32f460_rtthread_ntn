@@ -144,6 +144,9 @@ void ntn_reset(rt_uint32_t pulse_ms);
  * @param buf_sz Size of response buffer
  * @param timeout_ms Timeout in milliseconds
  * @return RT_EOK on OK, -RT_ETIMEOUT on timeout, -RT_ERROR on ERROR
+ * @note Timeout means the execution result is unknown; commands are not replayed.
+ *       Further commands wait for the old final result or require ntn_reset.
+ *       -RT_EFULL means the response buffer was truncated.
  */
 rt_err_t ntn_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz, rt_uint32_t timeout_ms);
 /* Reserved for CTRL2 NTN_REQUEST worker while temporary debug lock is held. */

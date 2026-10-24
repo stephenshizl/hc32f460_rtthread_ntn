@@ -100,7 +100,8 @@ int app_flash_init(void)
     }
 
     /* 2. Probe Flash via SFUD (Serial Flash Universal Driver) */
-    sfud_flash_t sfud_dev = rt_sfud_flash_find_by_dev_name(FAL_USING_NOR_FLASH_DEV_NAME);
+    sfud_flash_t sfud_dev = rt_device_find(FAL_USING_NOR_FLASH_DEV_NAME) != RT_NULL ?
+                           rt_sfud_flash_find_by_dev_name(FAL_USING_NOR_FLASH_DEV_NAME) : RT_NULL;
     if (sfud_dev == RT_NULL)
     {
         rt_err_t ret = flash_check_jedec_id();
@@ -144,7 +145,8 @@ static void flash_info(int argc, char **argv)
 {
     app_flash_init();
 
-    sfud_flash_t sfud_dev = rt_sfud_flash_find_by_dev_name(FAL_USING_NOR_FLASH_DEV_NAME);
+    sfud_flash_t sfud_dev = rt_device_find(FAL_USING_NOR_FLASH_DEV_NAME) != RT_NULL ?
+                           rt_sfud_flash_find_by_dev_name(FAL_USING_NOR_FLASH_DEV_NAME) : RT_NULL;
     rt_kprintf("\n================= Flash & FAL Status =================\n");
     if (sfud_dev != RT_NULL)
     {
