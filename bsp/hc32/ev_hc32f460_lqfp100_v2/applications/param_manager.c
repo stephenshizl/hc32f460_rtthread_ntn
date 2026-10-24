@@ -713,17 +713,27 @@ int param_manager_init(void)
     {
         return RT_EOK;
     }
-    if (app_flash_init() != RT_EOK)
+    /* Keep local interfaces usable even when external storage is unavailable. */
+    if (rt_mutex_init(&s_param_lock, "parm_lck", RT_IPC_FLAG_PRIO) != RT_EOK)
     {
         return -RT_ERROR;
+    }
+    param_set_defaults(&s_config);
+    s_active_sec = 0U;
+    s_persisted_config = RT_FALSE;
+    if (app_flash_init() != RT_EOK)
+    {
+        LOG_W("Flash unavailable; using RAM defaults (RS232 19200, mode 0), saving disabled");
+        s_param_inited = RT_TRUE;
+        return RT_EOK;
     }
     s_param_part = fal_partition_find(PARAM_PARTITION_NAME);
     if (s_param_part == RT_NULL)
     {
-        LOG_E("Partition '%s' not found", PARAM_PARTITION_NAME);
-        return -RT_ERROR;
+        LOG_W("Partition '%s' not found; using RAM defaults, saving disabled", PARAM_PARTITION_NAME);
+        s_param_inited = RT_TRUE;
+        return RT_EOK;
     }
-    rt_mutex_init(&s_param_lock, "parm_lck", RT_IPC_FLAG_PRIO);
     a_valid = (fal_partition_read(s_param_part, PARAM_SECTOR_A_OFF,
                                   (rt_uint8_t *)&cfg_a, sizeof(cfg_a)) >= 0 &&
                param_config_is_valid(&cfg_a)) ? RT_TRUE : RT_FALSE;

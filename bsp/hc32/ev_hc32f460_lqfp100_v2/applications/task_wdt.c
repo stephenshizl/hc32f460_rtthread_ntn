@@ -248,7 +248,7 @@ int task_wdt_init(void)
     task_wdt_register("ble",      30);  /* BLE 5.0 UART thread */
     task_wdt_register("gnss",     30);  /* Beidou GNSS thread */
     task_wdt_register("ntn",      60);  /* MS150 satellite thread */
-    task_wdt_register("sf_flush", 60);  /* Store & Forward flush daemon */
+    /* V3 replay runs in raw_tx, which registers its own watchdog heartbeat. */
 
     /* 3. Start watchdog daemon thread */
     s_wdt_thread = rt_thread_create("wdt_mgr",

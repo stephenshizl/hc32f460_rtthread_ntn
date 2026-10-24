@@ -988,7 +988,7 @@ int gnss_init(void)
         return RT_EOK;
     }
 
-    LOG_I("Initializing GNSS (UM220-IV-M) on %s (PA3-RX, PA4-TX)...", GNSS_UART_NAME);
+    LOG_I("Initializing GNSS (UM220-IV-M) on %s (PA4-RX, PA3-TX)...", GNSS_UART_NAME);
 
     /* 1. Ensure RNSS power rail (PH2) is enabled */
     hw_power_rnss_set(RT_TRUE);
@@ -1174,7 +1174,7 @@ static int gnss_status(int argc, char **argv)
     rt_bool_t fresh = gnss_is_fresh(10000); /* 10s freshness threshold */
 
     rt_kprintf("\r\n================ GNSS Status ================\r\n");
-    rt_kprintf(" Port           : %s (PA3-RX, PA4-TX)\r\n", GNSS_UART_NAME);
+    rt_kprintf(" Port           : %s (PA4-RX, PA3-TX)\r\n", GNSS_UART_NAME);
     rt_kprintf(" Constellations : GPS+BDS+GAL+SBAS+QZSS (%s)\r\n",
                gnss_is_configured() ? "CONFIG OK" : "CONFIG PENDING/FAILED");
     rt_kprintf(" NMEA Output    : GGA+GSA+GSV+RMC @ 1 Hz\r\n");

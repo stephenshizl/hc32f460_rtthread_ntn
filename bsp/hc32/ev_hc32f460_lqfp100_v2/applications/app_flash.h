@@ -5,7 +5,7 @@
  *
  * Change Logs:
  * Date           Author       Notes
- * 2026-10-14     Stephen      Stage 4: External QSPI Flash (ZD25WQ16C) & FAL initialization
+ * 2026-10-14     Stephen      Stage 4: External QSPI Flash & FAL initialization
  */
 
 #ifndef __APP_FLASH_H__

@@ -42,7 +42,7 @@ int hw_power_init(void)
      * - PB15: NTN Core Power Switch (PMOS)
      * - PB0:  RF PA 4.16V DCDC Enable
      * - PA8:  Hardware Reset (Active High turns on NPN pulling ST1000 RESETN Low)
-     * - PA15: Wakeup (High = active)
+     * - PA15: Wakeup (Low = active/keep awake, High = allow deep sleep)
      * - PA10: Boot mode (Low = normal, High = bootloader)
      * - PB3:  Status input
      */
@@ -50,7 +50,7 @@ int hw_power_init(void)
     rt_pin_write(NTN_BOOT_PIN, PIN_LOW);
 
     rt_pin_mode(NTN_WAKEUP_PIN, PIN_MODE_OUTPUT);
-    rt_pin_write(NTN_WAKEUP_PIN, PIN_HIGH);
+    rt_pin_write(NTN_WAKEUP_PIN, PIN_LOW);
 
     rt_pin_mode(NTN_STATUS_PIN, PIN_MODE_INPUT);
 
@@ -101,9 +101,9 @@ void hw_power_ntn_set(rt_bool_t on)
     {
         LOG_I("[NTN] Powering ON modem and RF PA...");
 
-        /* 1. Ensure normal run mode and wakeup high */
+        /* 1. Ensure normal run mode and wakeup low (Active Low keeps MS150 awake) */
         rt_pin_write(NTN_BOOT_PIN, PIN_LOW);
-        rt_pin_write(NTN_WAKEUP_PIN, PIN_HIGH);
+        rt_pin_write(NTN_WAKEUP_PIN, PIN_LOW);
 
         /* 2. Hold reset asserted while power is ramping up */
         rt_pin_write(NTN_RST_PIN, PIN_HIGH);
@@ -227,6 +227,38 @@ int hw_ntn_status_get(void)
 }
 
 /**
+ * @brief Control NTN modem wakeup pin level (PA15)
+ */
+void hw_ntn_wakeup_set(rt_bool_t high)
+{
+    rt_pin_write(NTN_WAKEUP_PIN, high ? PIN_HIGH : PIN_LOW);
+}
+
+/**
+ * @brief Pulse NTN modem wakeup pin (PA15)
+ */
+void hw_ntn_wakeup_pulse(rt_uint32_t pulse_ms, rt_bool_t to_low)
+{
+    if (pulse_ms == 0)
+    {
+        pulse_ms = 100;
+    }
+
+    if (to_low)
+    {
+        rt_pin_write(NTN_WAKEUP_PIN, PIN_LOW);
+        rt_thread_mdelay(pulse_ms);
+        rt_pin_write(NTN_WAKEUP_PIN, PIN_HIGH);
+    }
+    else
+    {
+        rt_pin_write(NTN_WAKEUP_PIN, PIN_HIGH);
+        rt_thread_mdelay(pulse_ms);
+        rt_pin_write(NTN_WAKEUP_PIN, PIN_LOW);
+    }
+}
+
+/**
  * @brief Control Power OK LED (PA6)
  */
 void hw_led_power_set(rt_bool_t on)
@@ -274,7 +306,7 @@ static int power_status(int argc, char **argv)
     rt_kprintf("| NTN Modem Core Power (PMOS)       | PB15    | %-13s |\r\n", _ntn_power_state ? "ON (High)" : "OFF (Low)");
     rt_kprintf("| NTN RF PA Power (DCDC 4.16V)      | PB0     | %-13s |\r\n", _ntn_power_state ? "ON (High)" : "OFF (Low)");
     rt_kprintf("| NTN Reset Pin (Q3 NPN)            | PA8     | %-13s |\r\n", rt_pin_read(NTN_RST_PIN) ? "ASSERT (High)" : "RUN (Low)");
-    rt_kprintf("| NTN Wakeup Pin                    | PA15    | %-13s |\r\n", rt_pin_read(NTN_WAKEUP_PIN) ? "HIGH (Active)" : "LOW (Sleep)");
+    rt_kprintf("| NTN Wakeup Pin                    | PA15    | %-13s |\r\n", rt_pin_read(NTN_WAKEUP_PIN) ? "HIGH (Sleep)" : "LOW (Active)");
     rt_kprintf("| NTN Boot Mode Pin                 | PA10    | %-13s |\r\n", rt_pin_read(NTN_BOOT_PIN) ? "BOOT (High)" : "NORMAL (Low)");
     rt_kprintf("| NTN Status Feedback Pin           | PB3     | %-13s |\r\n", hw_ntn_status_get() ? "HIGH" : "LOW");
     rt_kprintf("+-----------------------------------+---------+---------------+\r\n");
@@ -381,6 +413,47 @@ static int power_reset_ntn(int argc, char **argv)
     return 0;
 }
 MSH_CMD_EXPORT(power_reset_ntn, trigger NTN hardware reset pulse [pulse_ms]);
+
+static int power_wakeup_ntn(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        rt_kprintf("Usage: power_wakeup_ntn [high | low | pulse_low [ms] | pulse_high [ms]]\r\n");
+        rt_kprintf("Current PA15 Pin State: %s\r\n", rt_pin_read(NTN_WAKEUP_PIN) ? "HIGH" : "LOW");
+        return -1;
+    }
+
+    if (rt_strcmp(argv[1], "high") == 0)
+    {
+        hw_ntn_wakeup_set(RT_TRUE);
+        rt_kprintf("[NTN] Wakeup pin (PA15) set to HIGH\r\n");
+    }
+    else if (rt_strcmp(argv[1], "low") == 0)
+    {
+        hw_ntn_wakeup_set(RT_FALSE);
+        rt_kprintf("[NTN] Wakeup pin (PA15) set to LOW\r\n");
+    }
+    else if (rt_strcmp(argv[1], "pulse_low") == 0)
+    {
+        rt_uint32_t ms = (argc >= 3) ? (rt_uint32_t)atoi(argv[2]) : 200;
+        rt_kprintf("[NTN] Pulsing wakeup pin LOW for %u ms (High->Low->High)...\r\n", ms);
+        hw_ntn_wakeup_pulse(ms, RT_TRUE);
+        rt_kprintf("[NTN] Pulse finished, back to HIGH\r\n");
+    }
+    else if (rt_strcmp(argv[1], "pulse_high") == 0)
+    {
+        rt_uint32_t ms = (argc >= 3) ? (rt_uint32_t)atoi(argv[2]) : 200;
+        rt_kprintf("[NTN] Pulsing wakeup pin HIGH for %u ms (Low->High->Low)...\r\n", ms);
+        hw_ntn_wakeup_pulse(ms, RT_FALSE);
+        rt_kprintf("[NTN] Pulse finished, back to LOW\r\n");
+    }
+    else
+    {
+        rt_kprintf("Unknown param: %s. Use high, low, pulse_low, or pulse_high\r\n", argv[1]);
+    }
+    return 0;
+}
+MSH_CMD_EXPORT(power_wakeup_ntn, control NTN wakeup pin: power_wakeup_ntn high/low/pulse_low/pulse_high);
 
 static int power_reset_rnss(int argc, char **argv)
 {

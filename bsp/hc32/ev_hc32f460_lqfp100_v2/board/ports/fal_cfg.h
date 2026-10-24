@@ -35,7 +35,7 @@ extern struct fal_flash_dev ext_nor_flash0;
 
 /* ====================== Partition Configuration ========================== */
 #ifdef FAL_PART_HAS_TABLE_CFG
-/* partition table (ZD25WQ16C: 2MB / 16Mbit NOR Flash) */
+/* BY25Q64ES: 8 MiB / 64 Mbit. Preserve the existing first 2 MiB layout. */
 #define FAL_PART_TABLE                                                                                  \
     {                                                                                                   \
         { FAL_PART_MAGIC_WROD, "app",           "onchip_flash",                0, 512 * 1024, 0 },      \
@@ -43,6 +43,7 @@ extern struct fal_flash_dev ext_nor_flash0;
         { FAL_PART_MAGIC_WROD, "factory",       FAL_USING_NOR_FLASH_DEV_NAME,  512 * 1024, 512 * 1024, 0 }, \
         { FAL_PART_MAGIC_WROD, "kvdb",          FAL_USING_NOR_FLASH_DEV_NAME,  1024 * 1024, 256 * 1024, 0 }, \
         { FAL_PART_MAGIC_WROD, "store_forward", FAL_USING_NOR_FLASH_DEV_NAME,  (1024 + 256) * 1024, 768 * 1024, 0 }, \
+        { FAL_PART_MAGIC_WROD, "reserved",      FAL_USING_NOR_FLASH_DEV_NAME,  2 * 1024 * 1024, 6 * 1024 * 1024, 0 }, \
     }
 #endif /* FAL_PART_HAS_TABLE_CFG */
 

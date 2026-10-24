@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define GNSS_UART_NAME          "uart2"         /* HC32F460 USART2: PA3(RX), PA4(TX) */
+#define GNSS_UART_NAME          "uart2"         /* V30 MCU USART2: PA4(RX), PA3(TX) */
 #define GNSS_DEFAULT_BAUDRATE   BAUD_RATE_115200/* UM220 standard baudrate */
 #define GNSS_NMEA_LINE_MAX_SZ   128             /* Maximum NMEA sentence length */
 #define GNSS_E7_SCALE           (10000000UL)    /* 10^7 scaling for high-precision fixed-point */

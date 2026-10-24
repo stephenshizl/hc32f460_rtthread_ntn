@@ -5,7 +5,7 @@
  *
  * Change Logs:
  * Date           Author       Notes
- * 2026-10-14     Stephen      Stage 4: External QSPI Flash (ZD25WQ16C) & FAL initialization
+ * 2026-10-14     Stephen      Stage 4: External QSPI Flash & FAL initialization
  */
 
 #include "app_flash.h"
@@ -30,6 +30,45 @@
 
 static rt_bool_t s_flash_init_ok = RT_FALSE;
 
+static rt_err_t flash_check_jedec_id(void)
+{
+    struct rt_qspi_device *device = (struct rt_qspi_device *)rt_device_find(QSPI_DEV_NAME);
+    struct rt_qspi_configuration config = {0};
+    const rt_uint8_t command = 0x9F;
+    rt_uint8_t id[3] = {0};
+    rt_err_t result;
+
+    if (device == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+    /* Use single-line SPI at 10 MHz to diagnose the bus before SFUD probing. */
+    config.parent.mode = RT_SPI_MODE_0 | RT_SPI_MSB;
+    config.parent.data_width = 8;
+    config.parent.max_hz = 10000000;
+    config.medium_size = 8UL * 1024UL * 1024UL;
+    config.qspi_dl_width = 1;
+    result = rt_qspi_configure(device, &config);
+    if (result != RT_EOK)
+    {
+        LOG_E("QSPI diagnostic configuration failed (%d)", result);
+        return result;
+    }
+    if (rt_qspi_send_then_recv(device, &command, 1, id, sizeof(id)) != sizeof(id))
+    {
+        LOG_E("QSPI JEDEC ID transfer failed");
+        return -RT_EIO;
+    }
+    LOG_I("Flash JEDEC ID: %02X %02X %02X (expected BY25Q64ES: 68 40 17)",
+          id[0], id[1], id[2]);
+    if (id[0] != 0x68 || id[1] != 0x40 || id[2] != 0x17)
+    {
+        LOG_E("Unexpected Flash ID; check VCC, CS, CLK, IO0/IO1 and HOLD/WP levels");
+        return -RT_ERROR;
+    }
+    return RT_EOK;
+}
+
 const struct fal_partition *app_flash_get_partition(const char *part_name)
 {
     if (!s_flash_init_ok || part_name == RT_NULL)
@@ -46,7 +85,7 @@ int app_flash_init(void)
         return RT_EOK;
     }
 
-    LOG_I("Initializing External QSPI NOR Flash (ZD25WQ16C 2MB)...");
+    LOG_I("Initializing External QSPI NOR Flash (BY25Q64ES 8 MiB, JEDEC 68 40 17)...");
 
     /* 1. Attach QSPI device to QSPI bus with hardware CS pin PB1 */
     if (rt_device_find(QSPI_DEV_NAME) == RT_NULL)
@@ -64,6 +103,11 @@ int app_flash_init(void)
     sfud_flash_t sfud_dev = rt_sfud_flash_find_by_dev_name(FAL_USING_NOR_FLASH_DEV_NAME);
     if (sfud_dev == RT_NULL)
     {
+        rt_err_t ret = flash_check_jedec_id();
+        if (ret != RT_EOK)
+        {
+            return ret;
+        }
         rt_spi_flash_device_t flash_dev = rt_sfud_flash_probe(FAL_USING_NOR_FLASH_DEV_NAME, QSPI_DEV_NAME);
         if (flash_dev == RT_NULL)
         {
@@ -76,13 +120,17 @@ int app_flash_init(void)
     if (sfud_dev != RT_NULL)
     {
         LOG_I("SFUD probed successfully: Chip=%s, Capacity=%d KB, EraseGran=%d B",
-              sfud_dev->chip.name,
+              sfud_dev->chip.name ? sfud_dev->chip.name : "BY25Q64ES (SFDP)",
               sfud_dev->chip.capacity / 1024,
               sfud_dev->chip.erase_gran);
     }
 
     /* 3. Initialize FAL (Flash Abstraction Layer) */
-    fal_init();
+    if (fal_init() <= 0)
+    {
+        LOG_E("FAL partition initialization failed");
+        return -RT_ERROR;
+    }
 
     s_flash_init_ok = RT_TRUE;
     LOG_I("FAL partitions initialized successfully.");
@@ -101,7 +149,9 @@ static void flash_info(int argc, char **argv)
     if (sfud_dev != RT_NULL)
     {
         rt_kprintf(" Flash Device  : %s\n", FAL_USING_NOR_FLASH_DEV_NAME);
-        rt_kprintf(" Chip Name     : %s\n", sfud_dev->chip.name);
+        rt_kprintf(" Chip Name     : %s\n", sfud_dev->chip.name ? sfud_dev->chip.name : "BY25Q64ES (SFDP)");
+        rt_kprintf(" JEDEC ID      : %02X %02X %02X\n", sfud_dev->chip.mf_id,
+                   sfud_dev->chip.type_id, sfud_dev->chip.capacity_id);
         rt_kprintf(" Total Size    : %d KB (%d MB)\n", sfud_dev->chip.capacity / 1024, sfud_dev->chip.capacity / (1024 * 1024));
         rt_kprintf(" Sector Size   : %d Bytes\n", sfud_dev->chip.erase_gran);
     }
@@ -115,7 +165,7 @@ static void flash_info(int argc, char **argv)
     rt_kprintf(" | %-14s | %-12s | %-10s | %-10s |\n", "Name", "Flash Dev", "Offset", "Length");
     rt_kprintf(" -------------------------------------------------------------\n");
 
-    const char *parts[] = { "app", "download", "factory", "kvdb", "store_forward" };
+    const char *parts[] = { "app", "download", "factory", "kvdb", "store_forward", "reserved" };
     for (int i = 0; i < sizeof(parts)/sizeof(parts[0]); i++)
     {
         const struct fal_partition *p = fal_partition_find(parts[i]);

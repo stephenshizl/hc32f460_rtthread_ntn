@@ -14,10 +14,20 @@
 #include <board.h>
 
 #include "hw_power.h"
+#include "pc_rs232.h"
+#include "param_manager.h"
 
 int main(void)
 {
+    char boot_log[128];
+
     rt_kprintf("\r\n[SYS] NTN System Main Thread Started...\r\n");
+    /* One boot record on the customer port, after the PC router is initialized. */
+    rt_snprintf(boot_log, sizeof(boot_log),
+                "\r\n[BOOT] NTN-Terminal started, RS232=%u/8N1, mode=%u, config=%s\r\n",
+                pc_rs232_get_baudrate(), param_get_work_mode(),
+                param_has_persisted_config() ? "saved" : "RAM defaults");
+    pc_rs232_send_str(boot_log);
 
     while (1)
     {

@@ -83,6 +83,7 @@ typedef struct {
 #define SFUD_MF_ID_AMIC                                0x37
 #define SFUD_MF_ID_NOR_MEM                             0x52
 #define SFUD_MF_ID_SANYO                               0x62
+#define SFUD_MF_ID_BYT                                 0x68
 #define SFUD_MF_ID_INTEL                               0x89
 #define SFUD_MF_ID_ESMT                                0x8C
 #define SFUD_MF_ID_FUDAN                               0xA1
@@ -103,6 +104,7 @@ typedef struct {
     {"Micron",     SFUD_MF_ID_MICRON},                    \
     {"AMIC",       SFUD_MF_ID_AMIC},                      \
     {"Sanyo",      SFUD_MF_ID_SANYO},                     \
+    {"BYT",        SFUD_MF_ID_BYT},                       \
     {"Intel",      SFUD_MF_ID_INTEL},                     \
     {"ESMT",       SFUD_MF_ID_ESMT},                      \
     {"Fudan",      SFUD_MF_ID_FUDAN},                     \
@@ -123,6 +125,7 @@ typedef struct {
  */
 #define SFUD_FLASH_CHIP_TABLE                                                                                       \
 {                                                                                                                   \
+    {"BY25Q64ES", SFUD_MF_ID_BYT, 0x40, 0x17, 8L*1024L*1024L, SFUD_WM_PAGE_256B, 4096, 0x20},                     \
     {"AT45DB161E", SFUD_MF_ID_ATMEL, 0x26, 0x00, 2L*1024L*1024L, SFUD_WM_BYTE|SFUD_WM_DUAL_BUFFER, 512, 0x81},      \
     {"W25Q40BV", SFUD_MF_ID_WINBOND, 0x40, 0x13, 512L*1024L, SFUD_WM_PAGE_256B, 4096, 0x20},                        \
     {"W25X40CL", SFUD_MF_ID_WINBOND, 0x30, 0x13, 512L*1024L, SFUD_WM_PAGE_256B, 4096, 0x20},                        \

@@ -959,21 +959,11 @@ static rt_err_t ntn_exec_cmd_locked(const char *cmd, char *resp_buf,
 static rt_err_t ntn_command_recover_locked(void)
 {
     char response[64];
-    rt_tick_t deadline = rt_tick_get() + rt_tick_from_millisecond(10000U);
     rt_err_t result;
 
-    while ((rt_tick_get() - _last_rx_tick) < rt_tick_from_millisecond(2000U))
-    {
-        if ((rt_int32_t)(rt_tick_get() - deadline) >= 0)
-        {
-            return -RT_ETIMEOUT;
-        }
-        rt_thread_mdelay(100U);
-    }
-    result = ntn_exec_cmd_locked("AT", response, sizeof(response), 5000U);
-    if (result != RT_EOK) return result;
-    rt_thread_mdelay(1000U);
-    result = ntn_exec_cmd_locked("AT", response, sizeof(response), 5000U);
+    /* Wait briefly (200ms) for any trailing wake-up banner, then strike immediately while modem is awake */
+    rt_thread_mdelay(200U);
+    result = ntn_exec_cmd_locked("AT", response, sizeof(response), 3000U);
     return result;
 }
 
@@ -1441,6 +1431,14 @@ static int ntn_at(int argc, char **argv)
 
     rt_kprintf("[AT TX] %s\r\n", argv[1]);
     rt_err_t err = ntn_exec_cmd(argv[1], resp, sizeof(resp), 3000);
+    if (err == -RT_ETIMEOUT)
+    {
+        /* If modem was in DeepSleep, first attempt woke it up. Retry immediately while awake! */
+        rt_kprintf("[AT] Modem woke from DeepSleep, retrying immediately...\r\n");
+        rt_thread_mdelay(300);
+        err = ntn_exec_cmd(argv[1], resp, sizeof(resp), 3000);
+    }
+
     if (err == RT_EOK)
     {
         rt_kprintf("[AT RX] (OK):\r\n%s\r\n", resp);

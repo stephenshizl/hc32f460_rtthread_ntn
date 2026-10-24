@@ -21,8 +21,8 @@
 
 /************************* XTAL port **********************/
 #define XTAL_PORT    (GPIO_PORT_H)
-#define XTAL_IN_PIN  (GPIO_PIN_01)
-#define XTAL_OUT_PIN (GPIO_PIN_00)
+#define XTAL_IN_PIN  (GPIO_PIN_00)
+#define XTAL_OUT_PIN (GPIO_PIN_01)
 
 /************************ USART port **********************/
 #if defined(BSP_USING_UART1)
@@ -37,11 +37,11 @@
 
 #if defined(BSP_USING_UART2)
 #define USART2_RX_PORT (GPIO_PORT_A)
-#define USART2_RX_PIN  (GPIO_PIN_03)
+#define USART2_RX_PIN  (GPIO_PIN_04)
 #define USART2_RX_FUNC (GPIO_FUNC_37)
 
 #define USART2_TX_PORT (GPIO_PORT_A)
-#define USART2_TX_PIN  (GPIO_PIN_04)
+#define USART2_TX_PIN  (GPIO_PIN_03)
 #define USART2_TX_FUNC (GPIO_FUNC_36)
 #endif
 
@@ -68,7 +68,7 @@
 /************************ NTN Module Pins **********************/
 #define NTN_PWR_EN_PIN      GET_PIN(B, 15)  /* MCU_NTN_PWR_EN: PB15, High active */
 #define NTN_RST_PIN         GET_PIN(A, 8)   /* MCU_NTN_RST: PA8, High to reset, Low to run */
-#define NTN_WAKEUP_PIN      GET_PIN(A, 15)  /* MCU_WAKEUP_NTN: PA15 */
+#define NTN_WAKEUP_PIN      GET_PIN(A, 15)  /* MCU_WAKEUP_NTN: PA15, Low active (keep awake) */
 #define NTN_STATUS_PIN      GET_PIN(B, 3)   /* NTN_MCU_STATUS: PB3 */
 #define NTN_BOOT_PIN        GET_PIN(A, 10)  /* MCU_NTN_BOOT: PA10 */
 #define PA_PWREN_PIN        GET_PIN(B, 0)   /* PA_PWREN: PB0, High to enable PA power */
@@ -96,13 +96,7 @@
 #endif
 
 #if defined(BSP_USING_I2C3)
-#define I2C3_SDA_PORT (GPIO_PORT_B)
-#define I2C3_SDA_PIN  (GPIO_PIN_05)
-#define I2C3_SDA_FUNC (GPIO_FUNC_48)
-
-#define I2C3_SCL_PORT (GPIO_PORT_E)
-#define I2C3_SCL_PIN  (GPIO_PIN_15)
-#define I2C3_SCL_FUNC (GPIO_FUNC_49)
+#error "V30 board has no I2C3: PB5 is reserved for NTN USART3 RX"
 #endif
 
 /***********  ADC configure *********/

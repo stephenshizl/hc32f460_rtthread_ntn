@@ -61,6 +61,19 @@ void hw_reset_rnss(rt_uint32_t pulse_ms);
 int hw_ntn_status_get(void);
 
 /**
+ * @brief Control NTN modem wakeup pin level (PA15)
+ * @param high RT_TRUE for High, RT_FALSE for Low
+ */
+void hw_ntn_wakeup_set(rt_bool_t high);
+
+/**
+ * @brief Pulse NTN modem wakeup pin (PA15)
+ * @param pulse_ms Duration of pulse in ms
+ * @param to_low RT_TRUE: pulse Low (High -> Low -> High); RT_FALSE: pulse High (Low -> High -> Low)
+ */
+void hw_ntn_wakeup_pulse(rt_uint32_t pulse_ms, rt_bool_t to_low);
+
+/**
  * @brief Control Power OK LED (PA6)
  */
 void hw_led_power_set(rt_bool_t on);
