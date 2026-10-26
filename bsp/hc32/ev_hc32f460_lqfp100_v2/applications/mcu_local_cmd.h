@@ -10,7 +10,8 @@ typedef enum
     MCU_CMD_ACTION_NONE = 0,
     MCU_CMD_ACTION_APPLY_RS232_BAUD,
     MCU_CMD_ACTION_ENTER_PC_CONFIG,
-    MCU_CMD_ACTION_EXIT_PC_CONFIG
+    MCU_CMD_ACTION_EXIT_PC_CONFIG,
+    MCU_CMD_ACTION_REBOOT
 } mcu_cmd_action_type_t;
 
 typedef struct
@@ -27,5 +28,8 @@ typedef struct
 rt_bool_t mcu_local_cmd_execute(const rt_uint8_t *line, rt_size_t line_len,
                                 char *response, rt_size_t response_size,
                                 mcu_cmd_action_t *action);
+
+/* Call only after sending the command response, in thread context. */
+void mcu_local_cmd_apply_reboot(const mcu_cmd_action_t *action);
 
 #endif /* __MCU_LOCAL_CMD_H__ */

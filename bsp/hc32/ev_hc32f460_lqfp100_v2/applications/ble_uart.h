@@ -25,6 +25,7 @@ extern "C" {
 #define CTRL2_TYPE_NTN_FINAL       0x07U
 #define CTRL2_TYPE_LOCAL_PENDING   0x08U
 
+rt_size_t ble_management_send(rt_uint8_t kind,rt_uint16_t id,const void *data,rt_uint16_t len);
 int ble_uart_init(void);
 rt_size_t ble_uart_send(const void *buf, rt_size_t len);
 rt_size_t ble_ctrl2_send(rt_uint8_t type, rt_uint16_t request_id,

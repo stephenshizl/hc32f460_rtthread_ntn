@@ -27,7 +27,7 @@ NTN_FUNCTIONS = [
     "ntn_prepare_pc_uart", "at_line_dispatch", "ntn_rx_thread_entry",
     "at_line_reset_locked", "at_line_timeout_entry",
     "at_line_timeout_process", "ntn_exec_cmd_locked", "ntn_command_recover_locked",
-    "ntn_exec_cmd_internal", "ntn_exec_cmd", "ntn_at",
+    "ntn_exec_cmd_internal", "ntn_exec_cmd", "ntn_debug_exec_cmd", "ntn_at",
 ]
 POWER_FUNCTIONS = ["hw_power_ntn_set", "hw_ntn_wakeup_set", "hw_ntn_wakeup_pulse", "power_wakeup_ntn"]
 
@@ -43,9 +43,11 @@ typedef int rt_bool_t;
 typedef int rt_err_t;
 typedef size_t rt_size_t;
 typedef uint8_t rt_uint8_t;
+typedef uint16_t rt_uint16_t;
 typedef uint32_t rt_uint32_t;
 typedef int32_t rt_int32_t;
 typedef uint32_t rt_tick_t;
+static int _identity_query_active;
 #define RT_TRUE 1
 #define RT_FALSE 0
 #define RT_NULL NULL
@@ -62,7 +64,9 @@ typedef uint32_t rt_tick_t;
 #define rt_strcmp strcmp
 #define rt_strncmp strncmp
 #define rt_strlen strlen
+#define rt_memcpy memcpy
 #define rt_kprintf printf
+#define rt_snprintf snprintf
 #define NTN_RESP_BUF_MAX_SZ 1536
 #define NTN_AT_INTERBYTE_MS 2000U
 #define NTN_BOOT_PIN 0
@@ -98,10 +102,29 @@ static char uart_tx[2048], pc_rx[2048], last_pc_error[128], _local_response[2048
 static size_t uart_tx_len, pc_rx_len, rx_pos;
 static const char *rx_source;
 static jmp_buf rx_done;
-typedef struct { int unused; } mcu_cmd_action_t;
+/* Production action types are inserted before this stub block. */
+static int cpu_resets, rtt_reset;
+static char s_command[384], s_local_response[2048];
+#define CTRL2_TYPE_LOCAL_FINAL 1
+static rt_bool_t handle_reboot(const char *, char *, rt_size_t, mcu_cmd_action_t *);
+void mcu_local_cmd_apply_reboot(const mcu_cmd_action_t *);
 static int mcu_local_cmd_execute(const rt_uint8_t *s, rt_size_t n, char *r,
                                 rt_size_t size, mcu_cmd_action_t *action) {
-    (void)s; (void)n; (void)r; (void)size; (void)action; return 0;
+    char command[384];
+    if (n >= sizeof(command)) return 0;
+    memcpy(command, s, n); command[n] = 0;
+    action->type = MCU_CMD_ACTION_NONE;
+    return handle_reboot(command, r, size, action);
+}
+static int pc_rs232_set_baudrate(unsigned baud) { (void)baud; return RT_EOK; }
+static int param_set_rs232_baud(unsigned baud, int save) { (void)baud; (void)save; return RT_EOK; }
+static void rt_hw_cpu_reset(void) {
+    assert(!isr && now == 500);
+    if (!rtt_reset) {
+        assert(pc_writes == 1);
+        assert(strstr(last_pc_error, "REBOOTING") && strstr(last_pc_error, "OK"));
+    }
+    cpu_resets++;
 }
 static void local_action_apply(const mcu_cmd_action_t *action) { (void)action; }
 static void at_line_timeout_process(void);
@@ -132,6 +155,7 @@ static int rt_sem_take(struct semaphore *s, rt_tick_t timeout) {
     if (reply == 2) feed("\r\nBOOK\r\n");
     if (reply == 3) feed("\r\n+CME ERROR: 10\r\n");
     if (reply == 4) feed("\r\nREBOOTING\r\n");
+    if (reply == 5) feed("\r\nManufacturer:Mlink-tech Corporation\r\nModel:MS150\r\nVersion:V00_R005_CA033\r\nIMEI:862130042600001\r\nAdditional modem information\r\nOK\r\n");
     if (s->count) { s->count--; return 0; }
     now += timeout; return -RT_ETIMEOUT;
 }
@@ -149,6 +173,13 @@ static rt_size_t ntn_uart_write(const void *data, rt_size_t len) {
 static void pc_rs232_send_str(const char *s) {
     assert(!isr); pc_writes++;
     snprintf(last_pc_error, sizeof(last_pc_error), "%s", s);
+}
+static void ctrl2_send_text(rt_uint8_t type, rt_uint16_t request_id, const char *text) {
+    assert(type == CTRL2_TYPE_LOCAL_FINAL && request_id == 1);
+    pc_rs232_send_str(text); /* Capture the final response before CPU reset. */
+}
+static void ctrl2_apply_baud(rt_uint16_t id, const mcu_cmd_action_t *action) {
+    (void)id; (void)action; assert(0);
 }
 static void pc_rs232_send(const void *data, rt_size_t len) {
     assert(pc_rx_len + len < sizeof(pc_rx));
@@ -183,6 +214,7 @@ static void reset_state(void) {
     _pc_command_deadline = _debug_lock_deadline = 0;
     now = reply = sent_commands = late_pending = pc_writes = 0;
     write_count = reset_writes = 0;
+    cpu_resets = rtt_reset = 0;
     wake_response = reject_cmd_lock = rx_test = 0;
     uart_tx_len = pc_rx_len = rx_pos = 0;
     uart_tx[0] = pc_rx[0] = last_pc_error[0] = 0;
@@ -192,9 +224,50 @@ static void reset_state(void) {
 CASES = r'''
 int main(void) {
     char response[80];
+    /* Both PC modes acknowledge before delay/reset; nothing reaches MS150. */
+    reset_state();
+    at_line_dispatch((const rt_uint8_t *)"AT+MCUREBOOT", 12);
+    assert(cpu_resets == 1 && now == 500 && sent_commands == 0);
+    reset_state();
+    maint_local_command(NULL, (const uint8_t *)"AT+MCUREBOOT", 12);
+    assert(cpu_resets == 1 && now == 500 && sent_commands == 0);
+    reset_state();
+    ctrl2_handle_local(1, (const rt_uint8_t *)"AT+MCUREBOOT\r\n", 14);
+    assert(cpu_resets == 1 && now == 500 && sent_commands == 0);
+    reset_state();
+    ctrl2_handle_local(1, (const rt_uint8_t *)"AT+MCUREBOOT\r", 13);
+    assert(cpu_resets == 0 && strstr(last_pc_error, "MCUERROR:1"));
+    reset_state(); rtt_reset = 1;
+    assert(sys_reboot(2, NULL) == -RT_EINVAL && cpu_resets == 0 && now == 0);
+    assert(sys_reboot(1, NULL) == RT_EOK && cpu_resets == 1 && now == 500);
+    reset_state(); {
+        mcu_cmd_action_t action = {MCU_CMD_ACTION_NONE, 0, 0};
+        assert(!handle_reboot("AT+MCUREBOOT?", response, sizeof(response), &action));
+        assert(!handle_reboot("AT+MCUREBOOT=1", response, sizeof(response), &action));
+        mcu_local_cmd_apply_reboot(&action);
+        mcu_local_cmd_apply_reboot(NULL);
+        assert(cpu_resets == 0 && now == 0);
+    }
     reset_state(); reply = 1;
     assert(ntn_exec_cmd("AT", response, sizeof(response), 3000) == RT_EOK);
     assert(strstr(response, "OK") && sent_commands == 1);
+
+    /* Automatic and Bluetooth AT clients must wake a sleeping modem before TX. */
+    reset_state(); feed("\r\nENTER DEEPSLEEP\r\n"); wake_response = 1; reply = 1;
+    assert(ntn_exec_cmd("ATI", response, sizeof(response), 3000) == RT_EOK);
+    if (_modem_sleeping || sent_commands != 1 || pins[NTN_WAKEUP_PIN] != PIN_LOW) { fprintf(stderr, "FAIL: automatic client did not wake modem before TX\n"); return 42; }
+    reset_state(); feed("\r\nENTER DEEPSLEEP\r\n"); wake_response = 1; reply = 1; _debug_locked = 1; _debug_lock_deadline = 60000;
+    assert(ntn_exec_cmd_internal("ATI", response, sizeof(response), 3000, RT_TRUE) == RT_EOK);
+    if (_modem_sleeping || sent_commands != 1 || strcmp(uart_tx, "ATI\r")) { fprintf(stderr, "FAIL: debug client did not wake modem before TX\n"); return 42; }
+    /* Unknown-result protection still forbids a new wake/probe/command. */
+    reset_state(); _cmd_recovery_required = 1; _modem_sleeping = 1; _debug_locked = 1; _debug_lock_deadline = 60000;
+    assert(ntn_exec_cmd_internal("ATI", response, sizeof(response), 3000, RT_TRUE) == -RT_ETIMEOUT);
+    assert(sent_commands == 0 && write_count == 0);
+
+    /* Streaming debug callers must preserve a long response's terminal OK. */
+    reset_state(); reply = 5; _debug_locked = 1; _debug_lock_deadline = 60000;
+    assert(ntn_debug_exec_cmd("ATI", NULL, 0, 3000) == RT_EOK);
+    assert(_cmd_final_received && !_cmd_resp_truncated);
 
     /* A payload ending in OK is not a terminal result. */
     reset_state(); reply = 2;
@@ -305,7 +378,19 @@ def main():
         raise SystemExit("Set HOST_CC to the host GCC executable")
     ntn = (BSP / "applications/ntn_ms150.c").read_text(encoding="utf-8")
     power = (BSP / "applications/hw_power.c").read_text(encoding="utf-8")
-    code = STUBS + "\n".join(function(ntn, n) for n in NTN_FUNCTIONS)
+    local = (BSP / "applications/mcu_local_cmd.c").read_text(encoding="utf-8")
+    router = (BSP / "applications/app_telemetry.c").read_text(encoding="utf-8")
+    ble = (BSP / "applications/ble_uart.c").read_text(encoding="utf-8")
+    main_source = (BSP / "applications/main.c").read_text(encoding="utf-8")
+    header = (BSP / "applications/mcu_local_cmd.h").read_text(encoding="utf-8")
+    action_types = header[header.index("typedef enum"):header.index("/*\n * Execute")]
+    code = "#include <stdint.h>\ntypedef uint32_t rt_uint32_t;\n" + action_types + STUBS
+    code += function(local, "handle_reboot") + function(local, "mcu_local_cmd_apply_reboot")
+    code += function(router, "maint_local_command")
+    code += "\n".join(function(ble, n) for n in (
+        "ctrl2_trim_line", "ctrl2_is_printable", "ctrl2_handle_local"))
+    code += function(main_source, "sys_reboot")
+    code += "\n".join(function(ntn, n) for n in NTN_FUNCTIONS)
     code += "\n" + "\n".join(function(power, n) for n in POWER_FUNCTIONS) + CASES
     with tempfile.TemporaryDirectory(prefix="ntn_control_") as directory:
         source = Path(directory) / "test.c"

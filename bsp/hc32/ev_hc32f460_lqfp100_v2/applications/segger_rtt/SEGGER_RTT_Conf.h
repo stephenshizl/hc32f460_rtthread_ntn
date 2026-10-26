@@ -38,7 +38,7 @@ Purpose : Configuration for SEGGER Real Time Transfer on RT-Thread
 #define SEGGER_RTT_MAX_NUM_UP_BUFFERS             (3)     // Max. number of up-buffers (T->H)
 #define SEGGER_RTT_MAX_NUM_DOWN_BUFFERS           (3)     // Max. number of down-buffers (H->T)
 
-#define BUFFER_SIZE_UP                            (2048)  // Buffer size for terminal output (2KB)
+#define BUFFER_SIZE_UP                            (8192)  // Full shell help burst; keep non-blocking output
 #define BUFFER_SIZE_DOWN                          (128)   // Buffer size for terminal input (128B)
 
 #define SEGGER_RTT_PRINTF_BUFFER_SIZE             (64u)   // Buffer for RTT printf

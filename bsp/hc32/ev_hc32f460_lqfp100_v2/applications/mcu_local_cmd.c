@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "mcu_local_cmd.h"
+#include "bt_identity.h"
 #include "app_telemetry.h"
 #include "param_manager.h"
 #include "pc_rs232.h"
@@ -9,6 +10,7 @@
 #include "store_forward.h"
 #include "gnss_um220.h"
 #include "loc2_report.h"
+#include <rthw.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -419,6 +421,7 @@ static rt_bool_t handle_text_setting(const char *cmd, char *out, rt_size_t out_s
     if (value != RT_NULL)
     {
         result = param_set_dev_sn(value, RT_TRUE);
+        if (result==RT_EOK) bt_identity_sn_changed();
         if (result != RT_EOK) cmd_error(out, out_size, (result == -RT_EINVAL) ? 1 : 3);
         else rt_snprintf(out, out_size, "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"sn\":true}\r\nOK\r\n");
         return RT_TRUE;
@@ -1021,6 +1024,26 @@ static rt_bool_t handle_power_stub(const char *cmd, char *out, rt_size_t out_siz
     return RT_FALSE;
 }
 
+static rt_bool_t handle_reboot(const char *cmd, char *out, rt_size_t out_size,
+                               mcu_cmd_action_t *action)
+{
+    if (rt_strcmp(cmd, "AT+MCUREBOOT") != 0) return RT_FALSE;
+    action->type = MCU_CMD_ACTION_REBOOT;
+    rt_snprintf(out, out_size,
+                "\r\n+MCUREBOOT:{\"state\":\"REBOOTING\",\"delay_ms\":500}\r\nOK\r\n");
+    return RT_TRUE;
+}
+
+void mcu_local_cmd_apply_reboot(const mcu_cmd_action_t *action)
+{
+    if (action != RT_NULL && action->type == MCU_CMD_ACTION_REBOOT)
+    {
+        /* Let the response drain even at the minimum supported 9600 baud. */
+        rt_thread_mdelay(500U);
+        rt_hw_cpu_reset();
+    }
+}
+
 rt_bool_t mcu_local_cmd_execute(const rt_uint8_t *line, rt_size_t line_len,
                                 char *response, rt_size_t response_size,
                                 mcu_cmd_action_t *action)
@@ -1042,7 +1065,9 @@ rt_bool_t mcu_local_cmd_execute(const rt_uint8_t *line, rt_size_t line_len,
     rt_memcpy(cmd, line, line_len);
     cmd[line_len] = '\0';
 
-    if (handle_identity(cmd, response, response_size) ||
+    if (bt_identity_command(cmd,response,response_size) ||
+        handle_reboot(cmd, response, response_size, action) ||
+        handle_identity(cmd, response, response_size) ||
         handle_capability(cmd, response, response_size) ||
         handle_mode(cmd, response, response_size) ||
         handle_transfer_mode(cmd, response, response_size) ||

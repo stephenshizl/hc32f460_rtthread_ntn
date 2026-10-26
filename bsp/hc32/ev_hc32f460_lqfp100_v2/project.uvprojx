@@ -405,6 +405,11 @@
               <FilePath>applications\pc_maint_core.c</FilePath>
             </File>
             <File>
+              <FileName>bt_identity.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>applications\bt_identity.c</FilePath>
+            </File>
+            <File>
               <FileName>ble_uart.c</FileName>
               <FileType>1</FileType>
               <FilePath>applications\ble_uart.c</FilePath>

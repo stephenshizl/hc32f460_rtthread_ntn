@@ -79,6 +79,11 @@ typedef struct
 } param_config_t;
 #pragma pack()
 
+/* Schema-3 reserved_flags[0]: 0=legacy, 1=AUTO, 2=MANUAL.
+ * Existing field offsets/CRC/size remain unchanged for safe rollback. */
+typedef struct { char ble_name[32]; char dev_sn[33]; rt_uint8_t mode; } param_bt_config_t;
+void param_get_bt_snapshot(param_bt_config_t *out);
+rt_err_t param_set_bt_name(const char *name,rt_uint8_t mode,rt_bool_t save_now);
 int param_manager_init(void);
 const param_config_t *param_get_active(void);
 void param_get_snapshot(param_config_t *out_config);

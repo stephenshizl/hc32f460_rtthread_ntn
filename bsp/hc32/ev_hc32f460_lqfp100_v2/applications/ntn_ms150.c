@@ -92,6 +92,7 @@ static volatile rt_bool_t       _pc_command_active;
 static volatile rt_bool_t       _modem_sleeping;
 static volatile rt_tick_t       _pc_command_deadline;
 static ntn_raw_rx_handler_t     _raw_rx_handler;
+static volatile rt_bool_t _identity_query_active;
 static ntn_downlink_handler_t   _downlink_handler;
 
 static int ntn_hex_value(char ch)
@@ -344,6 +345,9 @@ static void ntn_prepare_pc_uart(void)
         {
             LOG_W("No wake-ready URC within 3 s; forwarding PC command once");
         }
+        /* EXIT DEEPSLEEP precedes the AT receiver becoming ready on this
+         * MS150 firmware. Settle once before TX; never replay the user AT. */
+        rt_thread_mdelay(200U);
     }
 }
 
@@ -359,6 +363,7 @@ static void at_line_dispatch(const rt_uint8_t *line, rt_size_t line_len)
                               sizeof(_local_response), &action))
     {
         pc_rs232_send_str(_local_response);
+        mcu_local_cmd_apply_reboot(&action);
         local_action_apply(&action);
         return;
     }
@@ -543,6 +548,7 @@ static void ntn_rx_thread_entry(void *parameter)
         while ((read_bytes = rt_device_read(_ntn_dev, 0, rx_buf, sizeof(rx_buf))) > 0)
         {
             rt_bool_t command_waiting = _cmd_waiting;
+            rt_bool_t identity_receiving = _identity_query_active;
             _stats.rx_bytes += read_bytes;
             ntn_command_receive(rx_buf, read_bytes);
 
@@ -551,13 +557,13 @@ static void ntn_rx_thread_entry(void *parameter)
                 ntn_rx_line_feed(rx_buf[i]);
             }
 
-            if (_raw_rx_handler != RT_NULL)
+            if (_raw_rx_handler != RT_NULL && !identity_receiving)
             {
                 _raw_rx_handler(rx_buf, read_bytes, command_waiting);
             }
 
             /* 1. If bridge mode is active, forward bytes to PC RS232 port */
-            if (_bridge_active && param_get_work_mode() == PARAM_MODE_AT_PASSTHROUGH &&
+            if (!identity_receiving && _bridge_active && param_get_work_mode() == PARAM_MODE_AT_PASSTHROUGH &&
                 !ntn_debug_lock_is_held())
             {
                 pc_rs232_send(rx_buf, read_bytes);
@@ -1128,6 +1134,10 @@ static rt_err_t ntn_exec_cmd_internal(const char *cmd, char *resp_buf,
             return result;
         }
     }
+    /* Bluetooth debug and the automatic service need the same sleep/wake
+     * handshake as PC commands. Keep recovery ahead of wakeup so an unknown
+     * previous result can never trigger a new probe or duplicate command. */
+    ntn_prepare_pc_uart();
     result = ntn_exec_cmd_locked(cmd, resp_buf, buf_sz, timeout_ms);
     rt_mutex_release(&_mutex_cmd);
     return result;
@@ -1143,6 +1153,23 @@ rt_err_t ntn_debug_exec_cmd(const char *cmd, char *resp_buf, rt_size_t buf_sz,
                             rt_uint32_t timeout_ms)
 {
     return ntn_exec_cmd_internal(cmd, resp_buf, buf_sz, timeout_ms, RT_TRUE);
+}
+
+rt_err_t ntn_identity_query(const char *cmd,char *response,rt_size_t capacity)
+{
+    rt_err_t result;
+    if (!_inited || !_ntn_dev || !response || capacity<64U ||
+        (rt_strcmp(cmd,"AT+CGSN=0") && rt_strcmp(cmd,"AT+CGSN=1"))) return -RT_EINVAL;
+    if (rt_mutex_take(&_mutex_cmd,0)!=RT_EOK) return -RT_EBUSY;
+    if (ntn_debug_lock_is_held() || _pc_command_active || _cmd_waiting ||
+        _cmd_recovery_required || _at_line_len || _at_discarding) {
+        rt_mutex_release(&_mutex_cmd);return -RT_EBUSY;
+    }
+    response[0]=0;_identity_query_active=RT_TRUE;
+    ntn_prepare_pc_uart();
+    result=ntn_exec_cmd_locked(cmd,response,capacity,1200U);
+    _identity_query_active=RT_FALSE;
+    rt_mutex_release(&_mutex_cmd);return result;
 }
 
 rt_size_t ntn_send_raw(const void *data, rt_size_t len)

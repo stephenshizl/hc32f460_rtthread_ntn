@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "param_manager.h"
+#include "bt_name_policy.h"
 #include "app_flash.h"
 #include <fal.h>
 #include <string.h>
@@ -48,6 +49,7 @@ static void param_set_defaults(param_config_t *cfg)
     cfg->magic = PARAM_MAGIC;
     cfg->schema_version = PARAM_SCHEMA_VERSION;
     cfg->struct_size = (rt_uint16_t)sizeof(*cfg);
+    cfg->reserved_flags[0] = 1U; /* Explicit AUTO, not inferred from nonempty name. */
     cfg->work_mode = PARAM_MODE_AT_PASSTHROUGH;
     cfg->transfer_mode = PARAM_TRANSFER_RAW;
     cfg->rx_mode = PARAM_RX_QUERY;
@@ -313,6 +315,7 @@ rt_err_t param_reset_operational(void)
     param_set_defaults(&s_config);
     rt_memcpy(s_config.dev_sn, sn, sizeof(sn));
     rt_memcpy(s_config.ble_name, ble_name, sizeof(ble_name));
+    s_config.reserved_flags[0] = before.reserved_flags[0];
     rt_memcpy(s_config.dev_hw_ver, hw_ver, sizeof(hw_ver));
     rt_memcpy(s_config.dev_sw_ver, sw_ver, sizeof(sw_ver));
     rt_mutex_release(&s_param_lock);
@@ -651,19 +654,30 @@ const char *param_get_ble_name(void)
     return s_config.ble_name;
 }
 
-rt_err_t param_set_ble_name(const char *name, rt_bool_t save_now)
+void param_get_bt_snapshot(param_bt_config_t *out)
+{
+    rt_mutex_take(&s_param_lock,RT_WAITING_FOREVER);
+    rt_memcpy(out->ble_name,s_config.ble_name,sizeof(out->ble_name));
+    rt_memcpy(out->dev_sn,s_config.dev_sn,sizeof(out->dev_sn));
+    out->mode=s_config.reserved_flags[0];
+    rt_mutex_release(&s_param_lock);
+}
+rt_err_t param_set_bt_name(const char *name,rt_uint8_t mode,rt_bool_t save_now)
 {
     param_config_t before;
-    if (name == RT_NULL || name[0] == '\0' || rt_strlen(name) > PARAM_BLE_NAME_MAX_LEN)
-    {
-        return -RT_EINVAL;
+    if (!btn_valid(name,31U) || (mode!=1U && mode!=2U)) return -RT_EINVAL;
+    rt_mutex_take(&s_param_lock,RT_WAITING_FOREVER);
+    if (s_config.reserved_flags[0]==mode && !rt_strcmp(s_config.ble_name,name)) {
+        rt_mutex_release(&s_param_lock);return RT_EOK;
     }
-    rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
-    before = s_config;
-    rt_strncpy(s_config.ble_name, name, sizeof(s_config.ble_name) - 1U);
-    s_config.ble_name[sizeof(s_config.ble_name) - 1U] = '\0';
+    before=s_config;
+    rt_strcpy(s_config.ble_name,name);s_config.reserved_flags[0]=mode;
     rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before,save_now);
+}
+rt_err_t param_set_ble_name(const char *name,rt_bool_t save_now)
+{
+    return param_set_bt_name(name,2U,save_now);
 }
 
 const char *param_get_dev_sn(void)
@@ -764,6 +778,12 @@ int param_manager_init(void)
         s_active_sec = 0U;
         s_persisted_config = RT_FALSE;
         LOG_W("No valid schema-3 config; using safe RAM defaults in mode 0");
+    }
+    /* Interpret old reserved=0 in RAM; first real update uses the usual
+     * alternate sector + CRC/readback save. Never erase the old copy here. */
+    if (s_config.reserved_flags[0]!=1U && s_config.reserved_flags[0]!=2U) {
+        s_config.reserved_flags[0]=btn_valid(s_config.ble_name,31U) &&
+            rt_strcmp(s_config.ble_name,"NTN-Terminal") ? 2U:1U;
     }
     s_param_inited = RT_TRUE;
     return RT_EOK;

@@ -60,6 +60,7 @@ static void maint_local_command(void *user, const uint8_t *data, size_t len)
         return;
     }
     pc_rs232_send_str(response);
+    mcu_local_cmd_apply_reboot(&action);
     if (action.type != MCU_CMD_ACTION_APPLY_RS232_BAUD) return;
     /* PENDING is sent at old baud; TX has 500 ms to drain before switching. */
     rt_thread_mdelay(500U);

@@ -17,7 +17,12 @@
 #define DBG_LVL DBG_INFO
 #include <rtdbg.h>
 
-#define RS232_THREAD_STACK_SZ   2048
+/* This thread also executes local AT commands and synchronous NV saves.
+ * ARMCC reports >2 KB for mode-0 saves and >5 KB through the mode-1
+ * maintenance callback (including its response buffer). Reserve headroom
+ * for indirect FAL/SFUD/SPI calls and the RTOS context frame.
+ */
+#define RS232_THREAD_STACK_SZ   8192
 #define RS232_THREAD_PRIO       9
 
 static rt_device_t            _serial_dev       = RT_NULL;

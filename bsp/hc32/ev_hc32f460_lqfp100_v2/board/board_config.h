@@ -56,12 +56,14 @@
 #endif
 
 #if defined(BSP_USING_UART4)
+/* Product schematic: PA7 (BT TX) -> BT_UART4_TXD -> PB6 (MCU RX),
+ * PB7 (MCU TX) -> BT_UART4_RXD -> PA8 (BT RX). */
 #define USART4_RX_PORT (GPIO_PORT_B)
-#define USART4_RX_PIN  (GPIO_PIN_07)
+#define USART4_RX_PIN  (GPIO_PIN_06)
 #define USART4_RX_FUNC (GPIO_FUNC_37)
 
 #define USART4_TX_PORT (GPIO_PORT_B)
-#define USART4_TX_PIN  (GPIO_PIN_06)
+#define USART4_TX_PIN  (GPIO_PIN_07)
 #define USART4_TX_FUNC (GPIO_FUNC_36)
 #endif
 

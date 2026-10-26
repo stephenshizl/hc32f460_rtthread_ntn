@@ -166,6 +166,8 @@ rt_size_t ntn_send_raw(const void *data, rt_size_t len);
  * @param out_info Pointer to output identity structure
  * @return RT_EOK on success
  */
+/* Bounded idle-only read: no debug lease stealing or unknown-result recovery. */
+rt_err_t ntn_identity_query(const char *cmd,char *response,rt_size_t capacity);
 rt_err_t ntn_get_info(ntn_modem_info_t *out_info);
 
 /**

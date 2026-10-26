@@ -244,8 +244,8 @@ int rt_hw_rtt_app_init(void)
     stc_clock_freq_t clock_freq;
 
 #if defined(RT_USING_FINSH)
-    /* Switch FinSH shell device to SEGGER RTT */
-    finsh_set_device("segger");
+    /* FinSH binds the console in its thread after finsh_system_init().
+     * APP init ordering does not guarantee that shell exists here. */
 
     /* Create and start RX check timer for interactive MSH shell (20ms interval) */
     rt_timer_init(&_rtt_rx_timer, "rtt_rx", rtt_rx_timer_callback, RT_NULL,

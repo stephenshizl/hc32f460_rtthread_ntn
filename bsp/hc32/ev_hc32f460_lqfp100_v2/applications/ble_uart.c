@@ -1,12 +1,15 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "ble_uart.h"
+#include "ntn_link.h"
+#include "bt_identity.h"
 #include "hw_power.h"
 #include "mcu_local_cmd.h"
 #include "ntn_ms150.h"
 #include "param_manager.h"
 #include "pc_rs232.h"
 #include "task_wdt.h"
+#include <rthw.h>
 #include <string.h>
 
 #define DBG_TAG "ble.ctrl2"
@@ -17,7 +20,12 @@
 #define BLE_THREAD_PRIO           10U
 #define CTRL2_FRAME_OVERHEAD      10U
 #define CTRL2_MAX_FRAME_SIZE      (CTRL2_MAX_PAYLOAD + CTRL2_FRAME_OVERHEAD)
+#define BLE_UART_READY            0x01U
+#define BLE_UART_RAW_TEST         0x02U
+#define BLE_UART_RX_BUSY          0x04U
 
+static ntnl_decoder s_link_decoder;
+static rt_tick_t s_wire_last;
 static rt_device_t s_ble_dev;
 static struct rt_semaphore s_rx_sem;
 static struct rt_mutex s_tx_lock;
@@ -27,7 +35,8 @@ static struct rt_semaphore s_ntn_sem;
 static volatile rt_bool_t s_ntn_pending;
 static char s_ntn_cmd[CTRL2_MAX_PAYLOAD + 1U];
 static rt_tick_t s_rx_partial_tick;
-static rt_bool_t s_initialized;
+/* Reuse the former initialization word; diagnostics allocate no new RAM. */
+static volatile rt_uint32_t s_uart_flags;
 static rt_uint8_t s_rx_stream[CTRL2_RX_BUFFER_SIZE];
 static rt_size_t s_rx_length;
 static rt_uint8_t s_tx_frame[CTRL2_MAX_FRAME_SIZE];
@@ -84,14 +93,36 @@ static rt_size_t ble_write_all_locked(const rt_uint8_t *buf, rt_size_t len)
     return sent;
 }
 
+/* Caller owns the existing TX mutex across all chunks of one CTRL2 frame. */
+static rt_size_t ble_data_write_locked(const rt_uint8_t *buf,rt_size_t len)
+{
+    rt_uint8_t wire[NTNL_WIRE_MAX];rt_size_t sent=0;
+    while (sent<len) {
+        rt_uint16_t n=(len-sent>NTNL_MAX_PAYLOAD)?NTNL_MAX_PAYLOAD:(rt_uint16_t)(len-sent);
+        unsigned total=ntnl_encode(NTNL_DATA,0,buf+sent,n,wire);
+        if (ble_write_all_locked(wire,total)!=total) break;
+        sent+=n;
+    }
+    return sent;
+}
+rt_size_t ble_management_send(rt_uint8_t kind,rt_uint16_t id,const void *data,rt_uint16_t len)
+{
+    rt_uint8_t wire[NTNL_WIRE_MAX];unsigned total;rt_size_t written=0;
+    if (!(s_uart_flags & BLE_UART_READY) || len>NTNL_MAX_PAYLOAD) return 0;
+    total=ntnl_encode(kind,id,data,len,wire);
+    if (rt_mutex_take(&s_tx_lock,RT_WAITING_FOREVER)!=RT_EOK) return 0;
+    written=ble_write_all_locked(wire,total);rt_mutex_release(&s_tx_lock);
+    return written==total?len+1U:0U;
+}
+
 rt_size_t ble_uart_send(const void *buf, rt_size_t len)
 {
     rt_size_t sent = 0U;
-    if (!s_initialized || s_ble_dev == RT_NULL || buf == RT_NULL || len == 0U)
+    if (!(s_uart_flags & BLE_UART_READY) || s_ble_dev == RT_NULL || buf == RT_NULL || len == 0U)
         return 0U;
     if (rt_mutex_take(&s_tx_lock, RT_WAITING_FOREVER) == RT_EOK)
     {
-        sent = ble_write_all_locked((const rt_uint8_t *)buf, len);
+        sent = ble_data_write_locked((const rt_uint8_t *)buf, len);
         rt_mutex_release(&s_tx_lock);
     }
     return sent;
@@ -103,10 +134,16 @@ rt_size_t ble_ctrl2_send(rt_uint8_t type, rt_uint16_t request_id,
     rt_uint16_t crc;
     rt_size_t total;
     rt_size_t sent;
-    if (!s_initialized || payload_len > CTRL2_MAX_PAYLOAD ||
+    if (!(s_uart_flags & BLE_UART_READY) || payload_len > CTRL2_MAX_PAYLOAD ||
         (payload_len > 0U && payload == RT_NULL)) return 0U;
     total = CTRL2_FRAME_OVERHEAD + payload_len;
     if (rt_mutex_take(&s_tx_lock, RT_WAITING_FOREVER) != RT_EOK) return 0U;
+    /* Do not interleave asynchronous CTRL2 traffic with raw UART diagnostics. */
+    if (s_uart_flags & BLE_UART_RAW_TEST)
+    {
+        rt_mutex_release(&s_tx_lock);
+        return 0U;
+    }
     s_tx_frame[0] = CTRL2_SYNC_1;
     s_tx_frame[1] = CTRL2_SYNC_2;
     s_tx_frame[2] = CTRL2_VERSION;
@@ -119,7 +156,7 @@ rt_size_t ble_ctrl2_send(rt_uint8_t type, rt_uint16_t request_id,
     crc = ctrl2_crc16(&s_tx_frame[2], 6U + payload_len);
     s_tx_frame[8U + payload_len] = (rt_uint8_t)(crc >> 8);
     s_tx_frame[9U + payload_len] = (rt_uint8_t)crc;
-    sent = ble_write_all_locked(s_tx_frame, total);
+    sent = ble_data_write_locked(s_tx_frame, total);
     rt_mutex_release(&s_tx_lock);
     return sent;
 }
@@ -210,7 +247,10 @@ static void ctrl2_handle_local(rt_uint16_t request_id,
         ctrl2_send_text(CTRL2_TYPE_LOCAL_FINAL, request_id,
                         "\r\n+MCUERROR:5\r\nERROR\r\n");
     else
+    {
         ctrl2_send_text(CTRL2_TYPE_LOCAL_FINAL, request_id, s_local_response);
+        mcu_local_cmd_apply_reboot(&action);
+    }
 }
 
 static void ctrl2_ntn_rx(const rt_uint8_t *data, rt_size_t len,
@@ -266,9 +306,14 @@ static void ctrl2_ntn_worker(void *parameter)
     for (;;)
     {
         rt_err_t result;
-        char response[96];
         char final[64];
-        (void)rt_sem_take(&s_ntn_sem, RT_WAITING_FOREVER);
+        if (rt_sem_take(&s_ntn_sem,rt_tick_from_millisecond(2000U))!=RT_EOK) {
+            rt_base_t level=rt_hw_interrupt_disable();
+            if (s_ntn_pending) {rt_hw_interrupt_enable(level);continue;}
+            s_ntn_pending=RT_TRUE;rt_hw_interrupt_enable(level);
+            bt_identity_poll(s_ntn_cmd,sizeof(s_ntn_cmd));
+            s_ntn_pending=RT_FALSE;continue;
+        }
         if (ntn_debug_lock_acquire() != RT_EOK)
         {
             ctrl2_send_text(CTRL2_TYPE_NTN_FINAL, s_ntn_request_id,
@@ -277,7 +322,9 @@ static void ctrl2_ntn_worker(void *parameter)
             continue;
         }
         s_ntn_request_active = RT_TRUE;
-        result = ntn_debug_exec_cmd(s_ntn_cmd, response, sizeof(response), 60000U);
+        /* All response bytes are already streamed as NTN_FRAGMENT frames.
+         * Do not impose a second 96-byte capture limit on the final result. */
+        result = ntn_debug_exec_cmd(s_ntn_cmd, RT_NULL, 0U, 60000U);
         s_ntn_request_active = RT_FALSE;
         /* A completed Bluetooth debug transaction must immediately return
          * UART3 ownership to the automatic NTN service.  Waiting for the
@@ -334,6 +381,12 @@ static void ctrl2_handle_frame(const rt_uint8_t *frame, rt_uint16_t payload_len)
     else
     {
         s_protocol_errors++;
+        /* These are MCU -> phone responses/events, never inbound requests.
+         * Ignore a local echo instead of replying ERROR to ERROR forever. */
+        if (type == CTRL2_TYPE_LOCAL_FINAL || type == CTRL2_TYPE_NTN_FRAGMENT ||
+            type == CTRL2_TYPE_NTN_ASYNC || type == CTRL2_TYPE_EVENT ||
+            type == CTRL2_TYPE_NTN_FINAL || type == CTRL2_TYPE_LOCAL_PENDING)
+            return;
         ctrl2_send_text(CTRL2_TYPE_LOCAL_FINAL, request_id,
                         "\r\n+MCUERROR:18\r\nERROR\r\n");
     }
@@ -394,6 +447,77 @@ static void ctrl2_parse_stream(void)
     }
 }
 
+static void ble_test_dump_rx(const rt_uint8_t *data, rt_size_t len)
+{
+    rt_size_t offset;
+    for (offset = 0U; offset < len; offset += 16U)
+    {
+        rt_size_t i;
+        rt_size_t count = (len - offset > 16U) ? 16U : len - offset;
+        rt_kprintf("[BT RX %u] HEX:", (unsigned)count);
+        for (i = 0U; i < count; i++) rt_kprintf(" %02X", data[offset + i]);
+        rt_kprintf("  ASCII:");
+        for (i = 0U; i < count; i++)
+        {
+            rt_uint8_t ch = data[offset + i];
+            rt_kprintf("%c", ch >= 0x20U && ch <= 0x7EU ? ch : '.');
+        }
+        rt_kprintf("\n");
+    }
+}
+
+static void ble_rx_process_chunk(const rt_uint8_t *chunk, rt_size_t count)
+{
+    rt_uint32_t flags;
+    rt_base_t level = rt_hw_interrupt_disable();
+    flags = s_uart_flags;
+    s_uart_flags |= BLE_UART_RX_BUSY;
+    rt_hw_interrupt_enable(level);
+
+    if (flags & BLE_UART_RAW_TEST)
+    {
+        /* Use the original RX thread/chunk; do not feed test bytes to CTRL2. */
+        ble_test_dump_rx(chunk, count);
+    }
+    else
+    {
+        if (s_rx_length != 0U &&
+            (rt_tick_get() - s_rx_partial_tick) >= rt_tick_from_millisecond(5000U))
+        {
+            s_rx_length = 0U;
+            s_protocol_errors++;
+        }
+        if (count > sizeof(s_rx_stream) - s_rx_length)
+        {
+            s_rx_length = 0U;
+            s_protocol_errors++;
+        }
+        if (count > 0U && count <= sizeof(s_rx_stream) - s_rx_length)
+        {
+            rt_memcpy(&s_rx_stream[s_rx_length], chunk, count);
+            s_rx_length += count;
+            s_rx_partial_tick = rt_tick_get();
+            ctrl2_parse_stream();
+        }
+    }
+    level = rt_hw_interrupt_disable();
+    s_uart_flags &= ~BLE_UART_RX_BUSY;
+    rt_hw_interrupt_enable(level);
+}
+
+static void ble_wire_received(unsigned char kind,unsigned short id,
+                              const unsigned char *payload,unsigned short len)
+{
+    if (kind==NTNL_DATA) ble_rx_process_chunk(payload,len);
+    else if (kind==NTNL_REPLY) bt_identity_link_reply(id,payload,len);
+}
+static void ble_wire_input(const rt_uint8_t *chunk,rt_size_t count)
+{
+    rt_tick_t now=rt_tick_get();
+    if ((now-s_wire_last)>rt_tick_from_millisecond(1000)) ntnl_expire(&s_link_decoder);
+    if (count) {ntnl_feed(&s_link_decoder,chunk,(unsigned)count,ble_wire_received);s_wire_last=now;}
+}
+
 static void ble_rx_thread_entry(void *parameter)
 {
     rt_uint8_t chunk[128];
@@ -403,26 +527,11 @@ static void ble_rx_thread_entry(void *parameter)
         rt_size_t count;
         (void)rt_sem_take(&s_rx_sem, rt_tick_from_millisecond(5000U));
         task_wdt_heartbeat_by_name("ble");
-        if (s_rx_length != 0U &&
-            (rt_tick_get() - s_rx_partial_tick) >= rt_tick_from_millisecond(5000U))
-        {
-            s_rx_length = 0U;
-            s_protocol_errors++;
-        }
+        ble_rx_process_chunk(RT_NULL, 0U);
+        ble_wire_input(RT_NULL,0U);
         while ((count = rt_device_read(s_ble_dev, 0, chunk, sizeof(chunk))) > 0U)
         {
-            if (count > sizeof(s_rx_stream) - s_rx_length)
-            {
-                s_rx_length = 0U;
-                s_protocol_errors++;
-            }
-            if (count <= sizeof(s_rx_stream) - s_rx_length)
-            {
-                rt_memcpy(&s_rx_stream[s_rx_length], chunk, count);
-                s_rx_length += count;
-                s_rx_partial_tick = rt_tick_get();
-                ctrl2_parse_stream();
-            }
+            ble_wire_input(chunk, count);
         }
     }
 }
@@ -430,7 +539,7 @@ static void ble_rx_thread_entry(void *parameter)
 int ble_uart_init(void)
 {
     struct serial_configure cfg = RT_SERIAL_CONFIG_DEFAULT;
-    if (s_initialized) return RT_EOK;
+    if (s_uart_flags & BLE_UART_READY) return RT_EOK;
     hw_power_bt_set(RT_TRUE);
     s_ble_dev = rt_device_find(BLE_UART_NAME);
     if (s_ble_dev == RT_NULL) return -RT_ERROR;
@@ -445,7 +554,7 @@ int ble_uart_init(void)
     rt_sem_init(&s_ntn_sem, "sbntn", 0, RT_IPC_FLAG_PRIO);
     rt_mutex_init(&s_tx_lock, "mctrl2", RT_IPC_FLAG_PRIO);
     rt_device_set_rx_indicate(s_ble_dev, ble_rx_ind);
-    s_initialized = RT_TRUE;
+    s_uart_flags = BLE_UART_READY;
     ntn_set_raw_rx_handler(ctrl2_ntn_rx);
     ntn_set_downlink_handler(ctrl2_downlink_event);
     task_wdt_register("ble", 10U);
@@ -453,7 +562,7 @@ int ble_uart_init(void)
                                    BLE_THREAD_STACK_SZ, BLE_THREAD_PRIO, 10U);
     if (s_rx_thread == RT_NULL)
     {
-        s_initialized = RT_FALSE;
+        s_uart_flags = 0U;
         return -RT_ERROR;
     }
     rt_thread_startup(s_rx_thread);
@@ -468,6 +577,121 @@ INIT_ENV_EXPORT(ble_uart_init);
 
 #ifdef RT_USING_FINSH
 #include <finsh.h>
+static int bt_test(int argc, char **argv)
+{
+    rt_base_t level;
+    rt_bool_t enabled;
+    if (argc != 2 || (rt_strcmp(argv[1], "on") != 0 && rt_strcmp(argv[1], "off") != 0))
+    {
+        rt_kprintf("Usage: bt_test <on|off>\n");
+        return -RT_EINVAL;
+    }
+    if (!(s_uart_flags & BLE_UART_READY)) return -RT_ERROR;
+    enabled = rt_strcmp(argv[1], "on") == 0;
+    if (rt_mutex_take(&s_tx_lock, RT_WAITING_FOREVER) != RT_EOK) return -RT_EBUSY;
+    level = rt_hw_interrupt_disable();
+    if ((s_uart_flags & BLE_UART_RX_BUSY) || s_ntn_pending || s_ntn_request_active)
+    {
+        rt_hw_interrupt_enable(level);
+        rt_mutex_release(&s_tx_lock);
+        rt_kprintf("BT busy; finish the active CTRL2 transaction and retry.\n");
+        return -RT_EBUSY;
+    }
+    if (enabled) s_uart_flags |= BLE_UART_RAW_TEST;
+    else s_uart_flags &= ~BLE_UART_RAW_TEST;
+    s_rx_length = 0U; /* Mode changes intentionally discard a partial frame. */
+    rt_hw_interrupt_enable(level);
+    rt_mutex_release(&s_tx_lock);
+    rt_kprintf("BT uart4 PB7(TX)/PB6(RX), 115200/8N1: %s, power=%s\n",
+               enabled ? "RAW TEST (CTRL2 paused)" : "CTRL2 restored",
+               hw_power_bt_get() ? "ON" : "OFF");
+    return RT_EOK;
+}
+MSH_CMD_EXPORT(bt_test, raw Bluetooth UART diagnostics <on|off> no new RAM);
+
+static int ble_test_tx_lock(void)
+{
+    if (!(s_uart_flags & BLE_UART_READY) || !hw_power_bt_get())
+    {
+        rt_kprintf("BT UART not ready or power OFF; check power_bt on.\n");
+        return -RT_ERROR;
+    }
+    if (rt_mutex_take(&s_tx_lock, RT_WAITING_FOREVER) != RT_EOK) return -RT_EBUSY;
+    if (!(s_uart_flags & BLE_UART_RAW_TEST))
+    {
+        rt_mutex_release(&s_tx_lock);
+        rt_kprintf("Run bt_test on first.\n");
+        return -RT_EBUSY;
+    }
+    return RT_EOK;
+}
+
+static int bt_send(int argc, char **argv)
+{
+    const char *ending = "\r\n";
+    rt_size_t ending_len = 2U;
+    rt_size_t len;
+    rt_size_t sent;
+    int result;
+    if (argc < 2 || argc > 3) goto usage;
+    if (argc == 3)
+    {
+        if (rt_strcmp(argv[2], "none") == 0) ending_len = 0U;
+        else if (rt_strcmp(argv[2], "cr") == 0) ending_len = 1U;
+        else if (rt_strcmp(argv[2], "crlf") != 0) goto usage;
+    }
+    result = ble_test_tx_lock();
+    if (result != RT_EOK) return result;
+    len = rt_strlen(argv[1]);
+    sent = ble_data_write_locked((const rt_uint8_t *)argv[1], len);
+    if (sent == len)
+        sent += ble_data_write_locked((const rt_uint8_t *)ending, ending_len);
+    rt_mutex_release(&s_tx_lock);
+    rt_kprintf("[BT TX] %u/%u bytes; this is TX only, check BT RX for reply.\n",
+               (unsigned)sent, (unsigned)(len + ending_len));
+    return sent == len + ending_len ? RT_EOK : -RT_ERROR;
+usage:
+    rt_kprintf("Usage: bt_send <text> [crlf|cr|none] (default crlf)\n");
+    return -RT_EINVAL;
+}
+MSH_CMD_EXPORT(bt_send, send raw text to Bluetooth UART default CRLF);
+
+static int ble_test_hex_nibble(char ch)
+{
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+static int bt_hex(int argc, char **argv)
+{
+    rt_size_t len;
+    rt_size_t i;
+    int result;
+    if (argc != 2) goto usage;
+    len = rt_strlen(argv[1]);
+    if (len == 0U || (len & 1U) != 0U) goto usage;
+    /* Validate everything before sending; invalid input must emit no bytes. */
+    for (i = 0U; i < len; i++) if (ble_test_hex_nibble(argv[1][i]) < 0) goto usage;
+    result = ble_test_tx_lock();
+    if (result != RT_EOK) return result;
+    for (i = 0U; i < len; i += 2U)
+    {
+        rt_uint8_t ch = (rt_uint8_t)((ble_test_hex_nibble(argv[1][i]) << 4) |
+                                    ble_test_hex_nibble(argv[1][i + 1U]));
+        if (ble_data_write_locked(&ch, 1U) != 1U) break;
+    }
+    rt_mutex_release(&s_tx_lock);
+    rt_kprintf("[BT TX HEX] %u/%u bytes; check BT RX for reply.\n",
+               (unsigned)(i / 2U), (unsigned)(len / 2U));
+    return i == len ? RT_EOK : -RT_ERROR;
+usage:
+    rt_kprintf("Usage: bt_hex <even-length HEX, e.g. 0055AA0D0A>\n");
+    return -RT_EINVAL;
+}
+MSH_CMD_EXPORT(bt_hex, send raw HEX bytes to Bluetooth UART without extra CRLF);
+
 static void ctrl2_status(int argc, char **argv)
 {
     RT_UNUSED(argc);
@@ -475,6 +699,9 @@ static void ctrl2_status(int argc, char **argv)
     rt_kprintf("ctrl2 frames=%u crc_err=%u proto_err=%u buffered=%u ntn_lock=%u\n",
                s_rx_frames, s_crc_errors, s_protocol_errors, s_rx_length,
                ntn_debug_lock_is_held());
+    rt_kprintf("uart4 115200/8N1, raw_test=%u, power=%s\n",
+               (s_uart_flags & BLE_UART_RAW_TEST) ? 1U : 0U,
+               hw_power_bt_get() ? "ON" : "OFF");
 }
 MSH_CMD_EXPORT(ctrl2_status, show MCU Bluetooth CTRL2 status);
 #endif
