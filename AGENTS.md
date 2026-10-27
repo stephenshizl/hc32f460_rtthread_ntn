@@ -1,8 +1,8 @@
-# RT-Thread AI Agent Rules / RT-Thread AI Agent 规则
+# youyoutech Project Rules / youyoutech 工程规范
 
 ## What this is / 这是什么
 
-- Rules for AI agents working in this repository. / 约束在本仓库内工作的 AI Agent。
+- Rules for developers and tools working in this repository. / 约束在本仓库内工作的开发人员与工具。
 - Core principle: make only minimal, task-focused, verifiable changes. / 核心原则：只做最小化、面向任务、可验证的改动。
 
 ## Allowed / 可以做什么
@@ -29,5 +29,12 @@
 
 ## Precedence / 优先级
 
-- GitHub Copilot should also follow `.github/copilot-instructions.md`. / GitHub Copilot 还应遵循 `.github/copilot-instructions.md`。
-- If a more specific repository rule conflicts with this file, follow `.github/copilot-instructions.md`, `.github/CONTRIBUTING.md`, `documentation/7.contribution/coding_style_cn.md`, and `documentation/7.contribution/coding_style_en.md`. / 如与更具体的仓库规则冲突，以 `.github/copilot-instructions.md`、`.github/CONTRIBUTING.md`、`documentation/7.contribution/coding_style_cn.md`、`documentation/7.contribution/coding_style_en.md` 为准。
+- Development and review tools should also follow `.github/project-instructions.md`. / 开发和审查工具还应遵循 `.github/project-instructions.md`。
+- If a more specific repository rule conflicts with this file, follow `.github/project-instructions.md`, `.github/CONTRIBUTING.md`, `documentation/7.contribution/coding_style_cn.md`, and `documentation/7.contribution/coding_style_en.md`. / 如与更具体的仓库规则冲突，以 `.github/project-instructions.md`、`.github/CONTRIBUTING.md`、`documentation/7.contribution/coding_style_cn.md`、`documentation/7.contribution/coding_style_en.md` 为准。
+
+## 署名与交付 / Attribution and delivery
+
+- 项目自有代码的公司署名统一使用 `youyoutech`。 / Use `youyoutech` for company attribution in project-owned code.
+- 注释、文档、界面及提交说明不得添加生成工具、服务商及其产品名称作为作者、版权方或协作署名，也不添加生成来源说明。 / Do not add generation tools, service providers or their product names as authors, copyright owners, collaborators or generation-origin notices in comments, documentation, UI or commit messages.
+- 保留第三方版权、许可证及真实贡献者信息，不将第三方成果改署为本公司。 / Preserve third-party copyright, licenses and real contributor credits; do not reattribute third-party work to the company.
+- 清理说明文字不得改变功能相关的符号、外设型号、协议、接口、依赖或文件路径。 / Text cleanup must preserve functional symbols, peripheral models, protocols, interfaces, dependencies and paths.

@@ -8,7 +8,7 @@
  * 2018-10-30     SummerGift   first version
  * 2020-03-16     SummerGift   add device close feature
  * 2020-03-20     SummerGift   fix bug caused by ORE
- * 2026-05-10     Codex        Reworked driver around BSP UART config tables
+ * 2026-05-10     Contributor         Reworked driver around BSP UART config tables
  */
 
 #include "board.h"

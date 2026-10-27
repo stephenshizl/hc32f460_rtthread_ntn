@@ -1,7 +1,7 @@
 /*
  * linker script for GD32E230x with GNU ld
  * Adapted from GD32E50x version.
- * Corrected by Gemini to fix oversized .bin file and subsequent linker errors.
+ * Corrected to fix oversized .bin file and subsequent linker errors.
  */
 
 MEMORY

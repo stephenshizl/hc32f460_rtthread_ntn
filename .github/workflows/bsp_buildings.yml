@@ -23,7 +23,7 @@ on:
       - .github/CODE_OF_CONDUCT.md
       - .github/CONTRIBUTING.md
       - .github/SECURITY.md
-      - .github/copilot-instructions.md
+      - .github/project-instructions.md
       - .github/labeler.yml
       - .github/figures/**
       - .github/utest/**
@@ -45,7 +45,7 @@ on:
       - .github/CODE_OF_CONDUCT.md
       - .github/CONTRIBUTING.md
       - .github/SECURITY.md
-      - .github/copilot-instructions.md
+      - .github/project-instructions.md
       - .github/labeler.yml
       - .github/figures/**
       - .github/utest/**

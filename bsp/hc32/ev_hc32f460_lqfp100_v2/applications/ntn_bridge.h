@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2026, Antigravity AI pair programming.
+ * Copyright (C) 2026, youyoutech.
  *
  * SPDX-License-Identifier: Apache-2.0
  *
  * Change Logs:
  * Date           Author       Notes
- * 2026-10-13     Antigravity  First version: PC <-> MCU <-> NTN transparent bridge
+ * 2026-10-13     youyoutech  First version: PC <-> MCU <-> NTN transparent bridge
  * 2026-10-14     Stephen      Redirect to enhanced MS150 NTN driver (ntn_ms150.h)
  */
 

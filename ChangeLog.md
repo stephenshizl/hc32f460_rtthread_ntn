@@ -383,7 +383,7 @@ Change Log Since v5.2.1 Release.
 * Fixed CI: ARDUINO_ADAFRUIT_SENSORLAB compilation failure issue.
 * Fixed CI compilation failure in sal/src/sal_socket.c.[(#10854)](https://github.com/RT-Thread/rt-thread/pull/10854)
 * Merge same tag with different paths, remove Path display from CI comment.
-* Add Copilot review title keywords.
+* Add automated review title keywords.
 * Add concurrency control to GitHub Actions. [(#10761)](https://github.com/RT-Thread/rt-thread/pull/10761)
 * integrate utest run ci. [(#10748)](https://github.com/RT-Thread/rt-thread/pull/10748)
 * Improve the comment instructions for the PR format bot.[(#10747)](https://github.com/RT-Thread/rt-thread/pull/10747)

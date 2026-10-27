@@ -5,7 +5,7 @@
  *
  * Change Logs:
  * Date           Author       Notes
- * 2026-07-10     Claude       N32 SDMMC driver with rt_mmcsd_host_ops,
+ * 2026-07-10     Contributor        N32 SDMMC driver with rt_mmcsd_host_ops,
  *                             SDMMC1/SDMMC2 dual-instance support.
  *
  * Low-level SDHOST ops (request/set_iocfg/get_card_status/enable_sdio_irq).

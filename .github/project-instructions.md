@@ -1,4 +1,4 @@
-# GitHub Copilot Instructions for RT-Thread / RT-Thread GitHub Copilot 指南
+# RT-Thread Project Instructions / RT-Thread 指南
 
 ## Overview / 概述
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, Antigravity AI pair programming.
+ * Copyright (c) 2026, youyoutech.
  *
  * SPDX-License-Identifier: Apache-2.0
  *
