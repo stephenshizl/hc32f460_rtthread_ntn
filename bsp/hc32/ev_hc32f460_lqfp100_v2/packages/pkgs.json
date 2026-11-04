@@ -1,0 +1,12 @@
+[
+ {
+  "name": "HC32F4_CMSIS_DRIVER",
+  "path": "/packages/peripherals/hal-sdk/hc32/hc32-f4-cmsis",
+  "ver": "latest"
+ },
+ {
+  "name": "HC32F4_SERIES_DRIVER",
+  "path": "/packages/peripherals/hal-sdk/hc32/hc32-f4-series",
+  "ver": "latest"
+ }
+]
