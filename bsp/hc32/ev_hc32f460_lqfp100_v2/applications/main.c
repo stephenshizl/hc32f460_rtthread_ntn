@@ -49,15 +49,14 @@ int main(void)
                 param_has_persisted_config() ? "saved" : "RAM defaults", __DATE__, __TIME__);
     pc_rs232_send_str(boot_log);
 
+    /* Keep POWER_OK high while the system is running. */
+    hw_led_power_set(RT_TRUE);
+
     while (1)
     {
         /* Reflect NTN network status pin on NET_OK LED */
         hw_led_net_set(hw_ntn_status_get() ? RT_TRUE : RT_FALSE);
 
-        /* Power LED heartbeat (500ms toggle) */
-        hw_led_power_set(RT_TRUE);
-        rt_thread_mdelay(500);
-        hw_led_power_set(RT_FALSE);
-        rt_thread_mdelay(500);
+        rt_thread_mdelay(1000);
     }
 }
