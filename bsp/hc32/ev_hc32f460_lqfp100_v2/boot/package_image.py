@@ -3,6 +3,7 @@
 """Extract an address-checked MDK image or assemble a signed L0 provisioning HEX."""
 import argparse
 import hashlib
+import json
 from pathlib import Path
 import struct
 import subprocess
@@ -12,9 +13,9 @@ from intelhex import IntelHex
 from prepare_mdk import GEN, MCUBOOT, layout_int
 
 
-def extract(path, base, limit, max_end=None):
+def extract(path, base, limit):
     image = IntelHex(str(path))
-    if image.minaddr() != base or image.maxaddr() >= (max_end if max_end is not None else base + limit):
+    if image.minaddr() != base or image.maxaddr() >= base + limit:
         raise ValueError(f"{path}: load addresses outside [{base:#x}, {base + limit:#x})")
     return bytes(image.tobinarray(start=base, end=image.maxaddr()))
 
@@ -79,18 +80,41 @@ def main():
     if len(icg) != 32 or icg[8:] != b"\xff" * 24:
         raise ValueError("L0 provisioning requires unprotected ICG4/5 and reserved words all ones")
     bl2 = extract(artifact("bl2"), bl2_base, bl2_size)
-    digest = hashlib.sha256(bl2.ljust(bl2_size, b"\xff")).digest()
+    bl2 = bl2.ljust(bl2_size, b"\xff")
+    digest = hashlib.sha256(bl2).digest()
     if digest not in bl1:
         raise ValueError("BL1 does not authorize this BL2")
+    from cryptography.hazmat.primitives import serialization
+    public = serialization.load_pem_public_key(args.public_key.read_bytes())
+    der = public.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    if der not in bl2:
+        raise ValueError("BL2 was built for a different App signing key")
     initial = GEN / "app.confirmed.bin"
     imgtool(*sign_options, "--pad", "--confirm", GEN / "app-body.bin", initial)
     if initial.stat().st_size != slot:
         raise ValueError("Unexpected primary slot length")
     flash = IntelHex()
     flash.frombytes(bl1, offset=0)
-    flash.frombytes(bl2.ljust(bl2_size, b"\xff"), offset=bl2_base)
+    flash.frombytes(bl2, offset=bl2_base)
     flash.frombytes(initial.read_bytes(), offset=primary)
     flash.write_hex_file(str(GEN / "ntn-ota-l0.hex"))
+    factory = GEN / "factory.signed.bin"
+    factory.write_bytes(compact.read_bytes())
+    manifest = {
+        "layout": layout_int("NTN_OTA_LAYOUT_ID"),
+        "app_version": args.version,
+        "public_key_sha256": hashlib.sha256(der).hexdigest(),
+        "icg": icg.hex(),
+        "onchip": [
+            {"name": "bl1", "offset": 0, "size": len(bl1), "sha256": hashlib.sha256(bl1).hexdigest()},
+            {"name": "bl2", "offset": bl2_base, "size": len(bl2), "sha256": digest.hex()},
+            {"name": "primary", "offset": primary, "size": slot,
+             "sha256": hashlib.sha256(initial.read_bytes()).hexdigest()},
+        ],
+        "nor": {"file": factory.name, "offset": layout_int("NTN_OTA_FACTORY"),
+                "size": factory.stat().st_size, "sha256": hashlib.sha256(factory.read_bytes()).hexdigest()},
+    }
+    (GEN / "ntn-ota-l0.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="ascii")
 
 
 if __name__ == "__main__":

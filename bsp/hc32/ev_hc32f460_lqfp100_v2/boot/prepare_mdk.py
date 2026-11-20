@@ -67,6 +67,22 @@ def save_project(tree, stage):
     tree.write(BSP / f"ntn-ota-{stage}.uvprojx", encoding="utf-8", xml_declaration=True)
 
 
+def workspace():
+    stages = ("bl1", "bl2", "app")
+    if not all((BSP / f"ntn-ota-{stage}.uvprojx").is_file() for stage in stages):
+        return
+    root = ET.Element("ProjectWorkspace")
+    ET.SubElement(root, "SchemaVersion").text = "1.0"
+    ET.SubElement(root, "WorkspaceName").text = "ntn-ota"
+    for stage in stages:
+        project = ET.SubElement(root, "project")
+        ET.SubElement(project, "PathAndName").text = f".\\ntn-ota-{stage}.uvprojx"
+        ET.SubElement(project, "NodeIsExpanded").text = "1"
+        if stage == "app":
+            ET.SubElement(project, "NodeIsActive").text = "1"
+    ET.ElementTree(root).write(BSP / "ntn-ota.uvmpw", encoding="utf-8", xml_declaration=True)
+
+
 def app_project():
     vector = layout_int("NTN_OTA_PRIMARY") + layout_int("NTN_OTA_HEADER_SIZE")
     tree, target = project("app", vector, layout_int("NTN_OTA_APP_MAX"))
@@ -201,6 +217,7 @@ def main():
         bl2_project(args.public_key)
     if args.bl2_bin:
         bl1_project(args.bl2_bin, args.watchdog)
+    workspace()
 
 
 if __name__ == "__main__":

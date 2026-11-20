@@ -45,3 +45,4 @@ cconfig.h
 /packages/**/*.SFR
 
 /ntn-ota-*.uvprojx
+/ntn-ota.uvmpw
