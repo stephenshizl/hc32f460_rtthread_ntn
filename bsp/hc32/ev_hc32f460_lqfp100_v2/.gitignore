@@ -43,3 +43,5 @@ cconfig.h
 # Prebuilt flash algorithms and debugger binaries in downloaded packages
 /packages/**/*.FLM
 /packages/**/*.SFR
+
+/ntn-ota-*.uvprojx

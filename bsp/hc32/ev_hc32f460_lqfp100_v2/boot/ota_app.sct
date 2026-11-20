@@ -1,0 +1,25 @@
+#! armcc -E
+#include "ota_layout.h"
+LR_IROM1 NTN_OTA_APP_VECTOR NTN_OTA_APP_MAX {
+    ER_VECTORS NTN_OTA_APP_VECTOR NTN_OTA_DESCRIPTOR_OFF {
+        *.o (RESET, +First)
+    }
+    ER_PRODUCT (NTN_OTA_APP_VECTOR + NTN_OTA_DESCRIPTOR_OFF) FIXED {
+        ota_identity.o (.ntn_product)
+    }
+    ER_CODE +0 {
+        *(InRoot$$Sections)
+        .ANY (+RO)
+        .ANY (+XO)
+    }
+    RW_IRAM1 0x1FFF8000 UNINIT 0x8 {
+        *(.bss.noinit)
+    }
+    RW_IRAM2 (NTN_OTA_MAILBOX + NTN_OTA_MAILBOX_SIZE) 0x2EFE8 {
+        .ANY (+RW +ZI)
+        .ANY (RAMCODE)
+    }
+    RW_IRAMB 0x200F0000 0x1000 {
+        .ANY (+RW +ZI)
+    }
+}
