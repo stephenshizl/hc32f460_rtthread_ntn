@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 #include "task_wdt.h"
 
 #define DBG_TAG "ntn.ms150"
@@ -28,10 +29,36 @@
 #define NTN_AT_LINE_MAX_SZ      2048U
 #define NTN_AT_INTERBYTE_MS     2000U
 #define NTN_AT_WHOLE_LINE_MS    30000U
-#define NTN_SERVICE_STACK_SZ    5120U
+#define NTN_SERVICE_STACK_SZ    7168U
 #define NTN_SERVICE_THREAD_PRIO 17U
 #define NTN_RX_LINE_MAX_SZ      1472U
 #define NTN_RX_QUERY_PERIOD_MS  5000U
+#define NTN_LOCATION_MAX_AGE_MS 5000U
+#define NTN_LOCATION_HORIZONTAL_M 500.0
+#define NTN_LOCATION_VERTICAL_MM 100000L
+#define NTN_LOCATION_CONFIRMATIONS 3U
+#define NTN_LOCATION_SAMPLE_MS 1000U
+
+typedef struct
+{
+    long latitude_mdeg;
+    long longitude_mdeg;
+    long altitude_mm;
+} ntn_location_t;
+
+typedef struct
+{
+    rt_bool_t valid;
+    ntn_location_t location;
+    unsigned int mismatched;
+} ntn_profile_t;
+
+enum
+{
+    NTN_PROFILE_CLEAN,
+    NTN_PROFILE_DIRTY,
+    NTN_PROFILE_VERIFY
+};
 
 static rt_device_t              _ntn_dev           = RT_NULL;
 static struct rt_semaphore      _sem_rx;
@@ -84,7 +111,14 @@ static rt_uint8_t               _rx_line[NTN_RX_LINE_MAX_SZ];
 static rt_size_t                _rx_line_len;
 static rt_bool_t                _rx_query_requested;
 static rt_tick_t                _rx_next_query_tick;
-static rt_tick_t                _ntn_location_last_tick;
+static ntn_location_t           _ntn_applied_location;
+static ntn_location_t           _ntn_written_location;
+static rt_bool_t                _ntn_verify_location;
+static rt_uint8_t               _ntn_profile_state;
+static rt_tick_t                _ntn_location_sample_tick;
+static rt_uint8_t               _ntn_horizontal_count;
+static rt_uint8_t               _ntn_vertical_count;
+static volatile rt_uint32_t     _ntn_boot_count;
 static volatile rt_bool_t       _cmd_recovery_required;
 static volatile rt_bool_t       _debug_locked;
 static volatile rt_tick_t       _debug_lock_deadline;
@@ -212,6 +246,12 @@ static void ntn_command_receive(const rt_uint8_t *data, rt_size_t length)
             failure = ((!_result_line_overflow && rt_strcmp(_result_line, "ERROR") == 0) ||
                        rt_strncmp(_result_line, "+CME ERROR:", 11U) == 0 ||
                        rt_strncmp(_result_line, "+CMS ERROR:", 11U) == 0);
+            if (!_result_line_overflow && rt_strcmp(_result_line, "RDY") == 0)
+            {
+                _ntn_boot_count++;
+                if (!_cmd_waiting) _cmd_recovery_required = RT_FALSE;
+                if (_cmd_waiting && _cmd_expect_reboot) success = RT_TRUE;
+            }
             if (!_result_line_overflow && rt_strcmp(_result_line, "REBOOTING") == 0)
             {
                 _pc_command_active = RT_FALSE;
@@ -583,6 +623,7 @@ static void service_set_state(ntn_service_state_t state, rt_err_t error)
     rt_mutex_take(&_service_lock, RT_WAITING_FOREVER);
     _service_status.state = state;
     _service_status.last_error = error;
+    if (state == NTN_SERVICE_WAIT_GNSS) _service_status.reg_status = NTN_REG_UNKNOWN;
     _service_status.send_ready = (state == NTN_SERVICE_READY) ? RT_TRUE : RT_FALSE;
     rt_mutex_release(&_service_lock);
 }
@@ -650,9 +691,6 @@ static rt_uint32_t service_config_key(const param_config_t *cfg)
     hash = service_hash_bytes(hash, &cfg->dns_mode, sizeof(cfg->dns_mode));
     hash = service_hash_bytes(hash, cfg->dns_primary, rt_strlen(cfg->dns_primary));
     hash = service_hash_bytes(hash, cfg->dns_secondary, rt_strlen(cfg->dns_secondary));
-    hash = service_hash_bytes(hash, cfg->ntn_apn, rt_strlen(cfg->ntn_apn));
-    hash = service_hash_bytes(hash, &cfg->ntn_location_enabled,
-                              sizeof(cfg->ntn_location_enabled));
     return hash;
 }
 
@@ -673,6 +711,239 @@ static rt_err_t service_exec(const char *command, char *response,
         LOG_W("NTN service command failed: %s (%d)", command, result);
     }
     return result;
+}
+
+static const struct
+{
+    const char *query;
+    const char *prefix;
+    const char *expected;
+    const char *setting;
+} _ntn_profile_settings[] =
+{
+    {"AT+CGDCONT?", "+CGDCONT:0,", "\"IP\",\"\"", "AT+CGDCONT=0,\"IP\",\"\""},
+    {"AT+MKBAND?", "+MKBAND:", "249", "AT+MKBAND=249"},
+    {"AT+MKEARFCN?", "+MKEARFCN:", "1,1,196702", "AT+MKEARFCN=1,1,196702"}
+};
+
+/* Extract a complete result line while accepting spaces around AT fields. */
+static rt_bool_t service_read_fields(const char *response, const char *prefix,
+                                     char *fields, rt_size_t size)
+{
+    while (*response != '\0')
+    {
+        char line[96];
+        rt_size_t len = 0U;
+        rt_bool_t quoted = RT_FALSE;
+        rt_size_t prefix_len = rt_strlen(prefix);
+
+        while (*response != '\0' && *response != '\r' && *response != '\n')
+        {
+            char ch = *response++;
+            if (ch == '"') quoted = !quoted;
+            if ((ch != ' ' && ch != '\t') || quoted)
+            {
+                if (len < sizeof(line) - 1U) line[len] = ch;
+                len++;
+            }
+        }
+        while (*response == '\r' || *response == '\n') response++;
+        if (len < prefix_len || rt_memcmp(line, prefix, prefix_len) != 0) continue;
+        if (len >= sizeof(line) || len - prefix_len >= size) return RT_FALSE;
+        rt_memcpy(fields, line + prefix_len, len - prefix_len);
+        fields[len - prefix_len] = '\0';
+        return RT_TRUE;
+    }
+    return RT_FALSE;
+}
+
+static rt_err_t service_read_profile(ntn_profile_t *profile, char *response, rt_size_t size)
+{
+    char fields[64];
+    char extra;
+    int type;
+    rt_size_t i;
+    rt_err_t result = service_exec("AT+LOCATION?", response, size, 5000U);
+    if (result != RT_EOK) return result;
+    if (!service_read_fields(response, "+LOCATION:", fields, sizeof(fields)) ||
+        sscanf(fields, "%d,%ld,%ld,%ld%c", &type, &profile->location.latitude_mdeg,
+               &profile->location.longitude_mdeg, &profile->location.altitude_mm, &extra) != 4 ||
+        (type != 0 && type != 1))
+    {
+        LOG_W("Invalid MS150 LOCATION readback");
+        return -RT_ERROR;
+    }
+    profile->valid = type == 0 &&
+                     profile->location.latitude_mdeg >= -90000L &&
+                     profile->location.latitude_mdeg <= 90000L &&
+                     profile->location.longitude_mdeg >= -180000L &&
+                     profile->location.longitude_mdeg <= 180000L &&
+                     profile->location.altitude_mm >= -1000000L &&
+                     profile->location.altitude_mm <= 6386985L;
+
+    profile->mismatched = 0U;
+    for (i = 0U; i < sizeof(_ntn_profile_settings) / sizeof(_ntn_profile_settings[0]); i++)
+    {
+        rt_bool_t found;
+        result = service_exec(_ntn_profile_settings[i].query, response, size, 5000U);
+        if (result != RT_EOK) return result;
+        found = service_read_fields(response, _ntn_profile_settings[i].prefix, fields, sizeof(fields));
+        if (!found && i != 0U)
+        {
+            LOG_W("Missing MS150 readback for %s", _ntn_profile_settings[i].query);
+            return -RT_ERROR;
+        }
+        if (found && rt_strcmp(fields, _ntn_profile_settings[i].expected) == 0) continue;
+        /* MS150 can omit the empty APN field in the CID 0 readback. */
+        if (found && i == 0U && rt_strcmp(fields, "\"IP\"") == 0) continue;
+        profile->mismatched |= 1U << i;
+    }
+    return RT_EOK;
+}
+
+static rt_bool_t service_get_gnss(gnss_data_t *fix)
+{
+    return gnss_get_data(fix) && fix->last_update_tick != 0U &&
+           (rt_tick_get() - fix->last_update_tick) <= rt_tick_from_millisecond(NTN_LOCATION_MAX_AGE_MS) &&
+           fix->altitude_valid &&
+           fix->latitude_e7 >= -900000000 && fix->latitude_e7 <= 900000000 &&
+           fix->longitude_e7 >= -1800000000 && fix->longitude_e7 <= 1800000000 &&
+           fix->altitude_mm >= -1000000 && fix->altitude_mm <= 6386985;
+}
+
+static rt_bool_t service_location_moved(const ntn_location_t *reference, const gnss_data_t *fix)
+{
+    /* Compare unrounded GNSS to the stored point using the haversine threshold. */
+    const double radians = 0.017453292519943295;
+    const double radius = 6371000.0;
+    double lat = fix->latitude_e7 / 10000000.0 * radians;
+    double ref_lat = reference->latitude_mdeg / 1000.0 * radians;
+    double lon_delta = (fix->longitude_e7 / 10000000.0 - reference->longitude_mdeg / 1000.0) * radians;
+    double lat_half = sin((lat - ref_lat) / 2.0);
+    double lon_half = sin(lon_delta / 2.0);
+    double limit = sin(NTN_LOCATION_HORIZONTAL_M / (2.0 * radius));
+
+    if (fix->last_update_tick != _ntn_location_sample_tick)
+    {
+        _ntn_location_sample_tick = fix->last_update_tick;
+        if (lat_half * lat_half + cos(lat) * cos(ref_lat) * lon_half * lon_half >= limit * limit)
+        {
+            if (_ntn_horizontal_count < NTN_LOCATION_CONFIRMATIONS) _ntn_horizontal_count++;
+        }
+        else _ntn_horizontal_count = 0U;
+
+        if (labs(fix->altitude_mm - reference->altitude_mm) >= NTN_LOCATION_VERTICAL_MM)
+        {
+            if (_ntn_vertical_count < NTN_LOCATION_CONFIRMATIONS) _ntn_vertical_count++;
+        }
+        else _ntn_vertical_count = 0U;
+    }
+    return _ntn_horizontal_count >= NTN_LOCATION_CONFIRMATIONS ||
+           _ntn_vertical_count >= NTN_LOCATION_CONFIRMATIONS;
+}
+
+static rt_bool_t service_same_location(const ntn_location_t *a, const ntn_location_t *b)
+{
+    return a->latitude_mdeg == b->latitude_mdeg && a->longitude_mdeg == b->longitude_mdeg &&
+           a->altitude_mm == b->altitude_mm;
+}
+
+static rt_err_t service_write_location(const gnss_data_t *fix, ntn_location_t *location)
+{
+    char command[64];
+    char response[128];
+
+    location->latitude_mdeg = (fix->latitude_e7 + (fix->latitude_e7 >= 0 ? 5000 : -5000)) / 10000;
+    location->longitude_mdeg = (fix->longitude_e7 + (fix->longitude_e7 >= 0 ? 5000 : -5000)) / 10000;
+    location->altitude_mm = fix->altitude_mm;
+    rt_snprintf(command, sizeof(command), "AT+LOCATION=0,%d,%d,%d",
+                (int)location->latitude_mdeg, (int)location->longitude_mdeg, (int)location->altitude_mm);
+    return ntn_exec_cmd(command, response, sizeof(response), 5000U);
+}
+
+static rt_err_t service_reboot_profile(char *response, rt_size_t size)
+{
+    rt_uint32_t boot_count = _ntn_boot_count;
+    rt_err_t result;
+    unsigned int attempt;
+
+    result = service_exec("AT+MKRB", response, size, 10000U);
+    if (result != RT_EOK && result != -RT_ETIMEOUT) return result;
+
+    /* A lost acknowledgement must not cause another reboot before checking RDY. */
+    _ntn_profile_state = NTN_PROFILE_VERIFY;
+    for (attempt = 0U; attempt < 20U && _ntn_boot_count == boot_count; attempt++)
+    {
+        rt_thread_mdelay(250U);
+    }
+    return service_exec("AT", response, size, 5000U);
+}
+
+static rt_err_t service_prepare_profile(char *response, rt_size_t size)
+{
+    ntn_profile_t profile;
+    gnss_data_t fix;
+    rt_size_t i;
+    rt_bool_t write_location;
+    rt_err_t result = service_read_profile(&profile, response, size);
+    if (result != RT_EOK) return result;
+
+    if (_ntn_profile_state == NTN_PROFILE_VERIFY)
+    {
+        if (profile.mismatched != 0U || !profile.valid ||
+            (_ntn_verify_location && !service_same_location(&profile.location, &_ntn_written_location)))
+        {
+            LOG_W("MS150 configuration verification failed (PDP/band/frequency mask=0x%x)", profile.mismatched);
+            return -RT_ERROR;
+        }
+        _ntn_profile_state = NTN_PROFILE_CLEAN;
+        _ntn_verify_location = RT_FALSE;
+    }
+
+    service_set_state(NTN_SERVICE_WAIT_GNSS, RT_EOK);
+    if (!service_get_gnss(&fix))
+    {
+        _ntn_horizontal_count = 0U;
+        _ntn_vertical_count = 0U;
+        return -RT_EEMPTY;
+    }
+    if (!service_same_location(&profile.location, &_ntn_applied_location))
+    {
+        _ntn_applied_location = profile.location;
+        _ntn_horizontal_count = 0U;
+        _ntn_vertical_count = 0U;
+        _ntn_location_sample_tick = 0U;
+    }
+    write_location = !profile.valid || service_location_moved(&profile.location, &fix);
+    if (!write_location && (_ntn_horizontal_count != 0U || _ntn_vertical_count != 0U))
+        return -RT_EEMPTY;
+
+    if (write_location)
+    {
+        ntn_location_t requested;
+        _ntn_profile_state = NTN_PROFILE_DIRTY;
+        result = service_write_location(&fix, &requested);
+        if (result != RT_EOK) return result;
+        _ntn_written_location = requested;
+        _ntn_verify_location = RT_TRUE;
+    }
+    for (i = 0U; i < sizeof(_ntn_profile_settings) / sizeof(_ntn_profile_settings[0]); i++)
+    {
+        if ((profile.mismatched & (1U << i)) == 0U) continue;
+        _ntn_profile_state = NTN_PROFILE_DIRTY;
+        result = service_exec(_ntn_profile_settings[i].setting, response, size, 5000U);
+        if (result != RT_EOK) return result;
+    }
+
+    if (_ntn_profile_state == NTN_PROFILE_DIRTY)
+    {
+        if (!_ntn_verify_location) _ntn_written_location = profile.location;
+        _ntn_verify_location = RT_TRUE;
+        result = service_reboot_profile(response, size);
+        /* Re-enter through the probe and verify before the first CEREG query. */
+        return result == RT_EOK ? -RT_EEMPTY : result;
+    }
+    return RT_EOK;
 }
 
 static rt_err_t service_prepare_socket(void)
@@ -706,6 +977,9 @@ static rt_err_t service_prepare_socket(void)
         return (result == RT_EOK) ? -RT_ERROR : result;
     }
 
+    result = service_prepare_profile(response, sizeof(response));
+    if (result != RT_EOK) return result;
+
     service_set_state(NTN_SERVICE_REGISTERING, RT_EOK);
     result = service_exec("AT+CEREG=1", response, sizeof(response), 5000U);
     if (result != RT_EOK) return result;
@@ -717,27 +991,13 @@ static rt_err_t service_prepare_socket(void)
     rt_mutex_release(&_service_lock);
     if (reg != NTN_REG_HOME && reg != NTN_REG_ROAMING)
     {
-        return -RT_EBUSY;
+        return reg == NTN_REG_SEARCHING ? -RT_EEMPTY : -RT_EBUSY;
     }
 
-    if (cfg.ntn_apn[0] != '\0')
-    {
-        rt_snprintf(command, sizeof(command), "AT+CGDCONT=0,\"IP\",\"%s\"", cfg.ntn_apn);
-        result = service_exec(command, response, sizeof(response), 5000U);
-        if (result != RT_EOK) return result;
-    }
     result = service_exec("AT+CGATT=1", response, sizeof(response), 180000U);
     if (result != RT_EOK) return result;
     result = service_exec("AT+CGACT=1,0", response, sizeof(response), 180000U);
     if (result != RT_EOK) return result;
-
-    if (cfg.ntn_location_enabled && gnss_is_fresh(5000U))
-    {
-        if (ntn_sync_gnss_location() == RT_EOK)
-        {
-            _ntn_location_last_tick = rt_tick_get();
-        }
-    }
 
     result = service_exec("AT+MKDATTYPE=1", response, sizeof(response), 5000U);
     if (result != RT_EOK) return result;
@@ -840,16 +1100,22 @@ static void ntn_service_thread_entry(void *parameter)
                 (void)service_exec("AT+MKRECEIVE=1", response,
                                    sizeof(response), 10000U);
             }
-            if (cfg.ntn_location_enabled && gnss_is_fresh(5000U) &&
-                (rt_tick_get() - _ntn_location_last_tick) >=
-                    rt_tick_from_millisecond(300000U))
             {
-                if (ntn_sync_gnss_location() == RT_EOK)
+                gnss_data_t fix;
+                if (!service_get_gnss(&fix))
                 {
-                    _ntn_location_last_tick = rt_tick_get();
+                    _ntn_horizontal_count = 0U;
+                    _ntn_vertical_count = 0U;
+                }
+                else if (service_location_moved(&_ntn_applied_location, &fix))
+                {
+                    char response[128];
+                    ntn_service_request_reconnect();
+                    (void)service_exec("AT+MKCLOSE=1", response, sizeof(response), 5000U);
+                    continue;
                 }
             }
-            rt_thread_mdelay(1000U);
+            rt_thread_mdelay(NTN_LOCATION_SAMPLE_MS);
             continue;
         }
         if ((rt_int32_t)(rt_tick_get() - _service_next_retry) < 0)
@@ -866,10 +1132,14 @@ static void ntn_service_thread_entry(void *parameter)
             service_set_state(NTN_SERVICE_READY, RT_EOK);
             LOG_I("NTN UDP socket 1 ready for %s:%u", cfg.host, cfg.remote_port);
         }
+        else if (result == -RT_EEMPTY)
+        {
+            rt_thread_mdelay(NTN_LOCATION_SAMPLE_MS);
+        }
         else
         {
             rt_uint32_t delay;
-            _service_fail_count++;
+            if (_service_fail_count < 4U) _service_fail_count++;
             delay = service_retry_delay_ms(_service_fail_count);
             _service_next_retry = rt_tick_get() + rt_tick_from_millisecond(delay);
             rt_mutex_take(&_service_lock, RT_WAITING_FOREVER);
@@ -1291,37 +1561,16 @@ rt_err_t ntn_get_signal(ntn_signal_t *out_sig)
 rt_err_t ntn_sync_gnss_location(void)
 {
     gnss_data_t gnss;
-    char cmd[64];
-    char resp[128];
+    ntn_location_t location;
+    rt_err_t err;
 
-    rt_int32_t lat_mdeg;
-    rt_int32_t lon_mdeg;
-
-    if (!gnss_get_data(&gnss) || !gnss_is_fresh(5000U) ||
-        !gnss.altitude_valid)
+    if (!service_get_gnss(&gnss))
     {
         LOG_W("Cannot sync location: GNSS fix not valid");
         return -RT_ERROR;
     }
 
-    if (gnss.latitude_e7 < -900000000 || gnss.latitude_e7 > 900000000 ||
-        gnss.longitude_e7 < -1800000000 || gnss.longitude_e7 > 1800000000 ||
-        gnss.altitude_mm < -1000000 || gnss.altitude_mm > 6386985)
-    {
-        return -RT_EINVAL;
-    }
-    lat_mdeg = (gnss.latitude_e7 >= 0) ?
-               (gnss.latitude_e7 + 5000) / 10000 :
-               (gnss.latitude_e7 - 5000) / 10000;
-    lon_mdeg = (gnss.longitude_e7 >= 0) ?
-               (gnss.longitude_e7 + 5000) / 10000 :
-               (gnss.longitude_e7 - 5000) / 10000;
-
-    rt_snprintf(cmd, sizeof(cmd), "AT+LOCATION=0,%d,%d,%d",
-                lat_mdeg, lon_mdeg, gnss.altitude_mm);
-    LOG_I("Syncing GNSS location to MS150: %s", cmd);
-
-    rt_err_t err = ntn_exec_cmd(cmd, resp, sizeof(resp), 2000);
+    err = service_write_location(&gnss, &location);
     if (err == RT_EOK)
     {
         LOG_I("GNSS location sync SUCCESS");
@@ -1497,8 +1746,13 @@ rt_err_t ntn_service_send_raw(const rt_uint8_t *payload, rt_size_t len)
     {
         return -RT_EINVAL;
     }
+    if (!_inited || rt_mutex_take(&_mutex_cmd, rt_tick_from_millisecond(82000U)) != RT_EOK)
+    {
+        return -RT_EBUSY;
+    }
     if (!ntn_service_is_send_ready())
     {
+        rt_mutex_release(&_mutex_cmd);
         return -RT_EBUSY;
     }
 
@@ -1528,6 +1782,7 @@ rt_err_t ntn_service_send_raw(const rt_uint8_t *payload, rt_size_t len)
         _service_next_retry = rt_tick_get() + rt_tick_from_millisecond(5000U);
         service_set_state(NTN_SERVICE_BACKOFF, result);
     }
+    rt_mutex_release(&_mutex_cmd);
     return result;
 }
 

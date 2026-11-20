@@ -83,6 +83,7 @@ struct semaphore { int count; };
 static struct semaphore _sem_resp, _sem_rx, _sem_awake;
 static struct { unsigned at_cmds_sent, at_cmds_ok, at_cmds_err, rx_bytes, bridge_ntn_to_pc; } _stats;
 static rt_bool_t _inited = RT_TRUE, _cmd_waiting, _cmd_final_received;
+static rt_uint32_t _ntn_boot_count;
 static rt_bool_t _cmd_resp_truncated, _cmd_expect_reboot, _result_line_overflow;
 static rt_bool_t _cmd_recovery_required, _pc_command_active, _at_discarding;
 static rt_bool_t _at_timeout_pending, _ntn_power_state;
@@ -296,6 +297,12 @@ int main(void) {
     feed("\r\nO"); assert(!_cmd_final_received);
     feed("K\r\n"); assert(_cmd_final_received && _cmd_status == RT_EOK);
     reset_state(); feed("EXIT DEEPSLEEP\r\n"); assert(!_cmd_final_received);
+    reset_state(); _cmd_recovery_required = 1;
+    feed("RDY\r\n");
+    assert(!_cmd_final_received && !_cmd_recovery_required && _ntn_boot_count == 1U);
+    reset_state(); _cmd_waiting = 1;
+    feed("RDY\r\n");
+    assert(!_cmd_final_received && _ntn_boot_count == 2U);
     reset_state(); reply = 4;
     assert(ntn_exec_cmd("AT+MKRB", response, sizeof(response), 3000) == RT_EOK);
 

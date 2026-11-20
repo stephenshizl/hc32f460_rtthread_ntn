@@ -89,7 +89,8 @@ typedef enum
     NTN_SERVICE_REGISTERING,
     NTN_SERVICE_OPENING,
     NTN_SERVICE_READY,
-    NTN_SERVICE_BACKOFF
+    NTN_SERVICE_BACKOFF,
+    NTN_SERVICE_WAIT_GNSS
 } ntn_service_state_t;
 
 typedef struct
