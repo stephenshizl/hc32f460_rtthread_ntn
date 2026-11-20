@@ -8,13 +8,21 @@
 #include "ota_jump.h"
 #include "ota_mailbox.h"
 #include "ota_serial.h"
+#include "ota_watchdog.h"
 #include "app_flash.h"
 #include "bootutil/bootutil.h"
 #include "bootutil/boot_hooks.h"
 #include "bootutil/boot_public_hooks.h"
 #include "bootutil/image.h"
+#include "bootutil_priv.h"
+#include "mcuboot_config/mcuboot_logging.h"
 #include "tinycrypt/ecc_platform_specific.h"
 #include "flash_map_backend/flash_map_backend.h"
+
+void ntn_ota_mcuboot_watchdog_feed(void)
+{
+    ntn_ota_feed_watchdog();
+}
 
 static bool compatible(const struct flash_area *area, const struct image_header *header)
 {
@@ -40,26 +48,96 @@ static bool compatible(const struct flash_area *area, const struct image_header 
            entry >= NTN_OTA_APP_VECTOR && entry < NTN_OTA_APP_VECTOR + header->ih_img_size;
 }
 
+static uint32_t image_extent(const struct flash_area *area, struct image_header *hdr)
+{
+    struct image_tlv_info tlv;
+    uint32_t off;
+
+    if (flash_area_read(area, 0, hdr, sizeof(*hdr)) || !compatible(area, hdr) ||
+        hdr->ih_protect_tlv_size > NTN_OTA_TLV_MAX)
+    {
+        ntn_ota_log_error("DOWNLOAD_HEADER_OR_TARGET");
+        return 0;
+    }
+    off = NTN_OTA_HEADER_SIZE + hdr->ih_img_size + hdr->ih_protect_tlv_size;
+    if (off > NTN_OTA_PACKAGE_MAX ||
+        flash_area_read(area, off, &tlv, sizeof(tlv)) ||
+        tlv.it_magic != IMAGE_TLV_INFO_MAGIC || tlv.it_tlv_tot < sizeof(tlv) ||
+        tlv.it_tlv_tot > NTN_OTA_TLV_MAX - hdr->ih_protect_tlv_size ||
+        tlv.it_tlv_tot > NTN_OTA_PACKAGE_MAX - off)
+    {
+        ntn_ota_log_error("DOWNLOAD_TLV_LENGTH");
+        return 0;
+    }
+    return off + tlv.it_tlv_tot;
+}
+
 bool ntn_ota_check_image(const struct flash_area *area, uint32_t received)
 {
     static uint8_t work[1024];
+    static struct boot_loader_state state;
+    static struct boot_sector_buffer sectors;
     struct image_header hdr;
-    struct image_tlv_info tlv;
-    uint32_t off;
     FIH_DECLARE(result, FIH_FAILURE);
+    uint32_t extent = image_extent(area, &hdr);
 
-    if (flash_area_read(area, 0, &hdr, sizeof(hdr)) || !compatible(area, &hdr) ||
-        hdr.ih_protect_tlv_size > NTN_OTA_TLV_MAX)
+    if (extent == 0)
         return false;
-    off = NTN_OTA_HEADER_SIZE + hdr.ih_img_size + hdr.ih_protect_tlv_size;
-    if (off >= received || received > NTN_OTA_PACKAGE_MAX ||
-        flash_area_read(area, off, &tlv, sizeof(tlv)) ||
-        tlv.it_magic != IMAGE_TLV_INFO_MAGIC || tlv.it_tlv_tot < sizeof(tlv) ||
-        tlv.it_tlv_tot > NTN_OTA_TLV_MAX - hdr.ih_protect_tlv_size ||
-        received - off != tlv.it_tlv_tot)
+    if (extent != received)
+    {
+        ntn_ota_log_error("DOWNLOAD_LENGTH_MISMATCH");
         return false;
-    FIH_CALL(bootutil_img_validate, result, NULL, &hdr, area, work, sizeof(work), NULL, 0, NULL);
+    }
+    /* Scratch-mode validation uses the sector geometry to bound the image. */
+    memset(&state, 0, sizeof(state));
+    if (boot_open_all_flash_areas(&state))
+    {
+        ntn_ota_log_error("DOWNLOAD_FLASH_MAP");
+        return false;
+    }
+    if (boot_read_sectors(&state, &sectors))
+    {
+        ntn_ota_log_error("DOWNLOAD_SECTOR_GEOMETRY");
+    }
+    else
+    {
+        FIH_CALL(bootutil_img_validate, result, &state, &hdr, area, work, sizeof(work), NULL, 0, NULL);
+        if (!FIH_EQ(result, FIH_SUCCESS))
+            ntn_ota_log_error("DOWNLOAD_HASH_OR_SIGNATURE");
+    }
+    boot_close_all_flash_areas(&state);
     return FIH_EQ(result, FIH_SUCCESS);
+}
+
+/* After boot_go has completed or rejected existing swap work, recover from
+ * an independent signed factory image through the normal MCUboot swap path. */
+static bool stage_factory_image(void)
+{
+    static uint8_t sector_data[1024];
+    const struct flash_area *factory, *secondary;
+    struct image_header hdr;
+    uint32_t size;
+
+    if (boot_swap_type() != BOOT_SWAP_TYPE_NONE ||
+        flash_area_open(NTN_AREA_FACTORY, &factory) ||
+        flash_area_open(FLASH_AREA_IMAGE_SECONDARY(0), &secondary))
+        return false;
+
+    size = image_extent(factory, &hdr);
+    if (!size || !ntn_ota_check_image(factory, size))
+        return false;
+    if (flash_area_erase(secondary, 0, NTN_OTA_SLOT_SIZE))
+        return false;
+    for (uint32_t offset = 0; offset < size;)
+    {
+        ntn_ota_feed_watchdog();
+        uint32_t count = size - offset < sizeof(sector_data) ? size - offset : sizeof(sector_data);
+        if (flash_area_read(factory, offset, sector_data, count) ||
+            flash_area_write(secondary, offset, sector_data, count))
+            return false;
+        offset += count;
+    }
+    return ntn_ota_check_image(secondary, size) && boot_set_pending(1) == 0;
 }
 
 int boot_read_image_header_hook(int image, int slot, struct image_header *hdr)
@@ -137,6 +215,7 @@ int main(void)
     struct boot_rsp response;
     FIH_DECLARE(result, FIH_FAILURE);
     int request = ntn_ota_take_boot_request();
+    ntn_ota_feed_watchdog();
     if (app_flash_init() == RT_EOK)
     {
         FIH_CALL(boot_go, result, &response);
@@ -156,10 +235,16 @@ int main(void)
             handoff();
         }
         ntn_ota_report_boot_error("BOOT2 ERROR APP_OR_SWAP\r\n");
+        if (stage_factory_image())
+        {
+            ntn_ota_report_boot_error("BOOT2 INFO FACTORY_STAGED\r\n");
+            NVIC_SystemReset();
+        }
         while (1)
         {
             if (ntn_ota_serial(10000U, "BOOT2 INFO BL1_OK NOR_OK RECOVERY\r\n"))
                 NVIC_SystemReset();
+            ntn_ota_feed_watchdog();
             rt_thread_mdelay(10);
         }
     }

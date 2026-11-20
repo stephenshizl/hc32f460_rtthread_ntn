@@ -82,7 +82,7 @@ def app_project():
     save_project(tree, "app")
 
 
-def bl1_project(bl2_bin):
+def bl1_project(bl2_bin, watchdog):
     raw = bl2_bin.read_bytes()
     size = layout_int("NTN_OTA_BL2_SIZE")
     if not 8 <= len(raw) <= size:
@@ -93,7 +93,11 @@ def bl1_project(bl2_bin):
     tree, target = project("bl1", 0, layout_int("NTN_OTA_BL1_SIZE"))
     groups = target.find("Groups")
     keep = {"startup_hc32f460.s", "system_hc32f460.c", "hc32_ll_icg.c",
-            "hc32_ll_fcg.c", "hc32_ll_utility.c", "hc32_ll_usart.c", "hc32_ll_gpio.c", "hc32_ll_clk.c"}
+            "hc32_ll_fcg.c", "hc32_ll_utility.c", "hc32_ll_usart.c", "hc32_ll_gpio.c",
+            "hc32_ll_clk.c", "hc32_ll_swdt.c"}
+    if watchdog:
+        target.find("TargetOption/TargetArmAds/Cads/VariousControls/MiscControls").text = (
+            "--preinclude boot/ota_icg.h")
     for group in list(groups):
         files = group.find("Files")
         for item in list(files):
@@ -180,6 +184,7 @@ def main():
     parser.add_argument("--build-id", help="32 hexadecimal digits")
     parser.add_argument("--public-key", type=Path, help="P-256 public key PEM for BL2")
     parser.add_argument("--bl2-bin", type=Path, help="BL2 raw image to authenticate in BL1")
+    parser.add_argument("--watchdog", action="store_true", help="Enable the ICG SWDT profile in BL1")
     args = parser.parse_args()
     if not (args.fetch_mcuboot or args.build_id or args.public_key or args.bl2_bin):
         parser.error("specify --fetch-mcuboot, --build-id, --public-key, or --bl2-bin")
@@ -195,7 +200,7 @@ def main():
     if args.public_key:
         bl2_project(args.public_key)
     if args.bl2_bin:
-        bl1_project(args.bl2_bin)
+        bl1_project(args.bl2_bin, args.watchdog)
 
 
 if __name__ == "__main__":

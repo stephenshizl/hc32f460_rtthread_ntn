@@ -8,6 +8,7 @@
 #include <rtdevice.h>
 #include "ota_layout.h"
 #include "ota_serial.h"
+#include "ota_watchdog.h"
 #include "flash_map_backend/flash_map_backend.h"
 #include "bootutil/bootutil_public.h"
 
@@ -39,6 +40,7 @@ static int read_byte(rt_device_t port, unsigned timeout)
     do
     {
         uint8_t byte;
+        ntn_ota_feed_watchdog();
         if (rt_device_read(port, 0, &byte, 1) == 1)
             return byte;
         rt_thread_mdelay(1);
@@ -272,7 +274,9 @@ int ntn_ota_serial(unsigned listen_ms, const char *status)
     }
     if (!ntn_ota_check_image(area, length))
     {
-        send_bytes(port, "ERROR BAD_IMAGE\r\n", 17);
+        send_boot_log(port, "BOOT2 ERROR VERIFY_STAGE\r\n");
+        const char error[] = "ERROR BAD_IMAGE\r\n";
+        send_bytes(port, error, sizeof(error) - 1U);
         goto close;
     }
     if (boot_set_pending(0))
@@ -285,6 +289,7 @@ int ntn_ota_serial(unsigned listen_ms, const char *status)
     rt_thread_mdelay(100);
     result = 1;
 close:
+    rt_thread_mdelay(15);
     rt_device_close(port);
     return result;
 }

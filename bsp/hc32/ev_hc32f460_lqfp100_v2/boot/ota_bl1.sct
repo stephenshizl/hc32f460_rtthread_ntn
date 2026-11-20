@@ -12,6 +12,9 @@ LR_BL1 NTN_OTA_BL1_BASE NTN_OTA_BL1_SIZE {
         .ANY (+RO)
         .ANY (+XO)
     }
+    RW_CLOCK 0x1FFF8000 UNINIT 0x8 {
+        *(.bss.noinit)
+    }
     RW_RAM (NTN_OTA_MAILBOX + NTN_OTA_MAILBOX_SIZE) 0x2EFE8 {
         .ANY (+RW +ZI)
     }

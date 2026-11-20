@@ -10,6 +10,9 @@
 
 #include "task_wdt.h"
 #include <string.h>
+#ifdef NTN_OTA_APP
+#include "ota_watchdog.h"
+#endif
 
 #ifdef DBG_TAG
 #undef DBG_TAG
@@ -186,6 +189,9 @@ static void task_wdt_daemon_entry(void *param)
         /* Only feed hardware WDT if ALL tasks are healthy */
         if (all_healthy)
         {
+#ifdef NTN_OTA_APP
+            ntn_ota_feed_watchdog();
+#endif
             if (s_hw_wdt_dev != RT_NULL)
             {
                 rt_device_control(s_hw_wdt_dev, RT_DEVICE_CTRL_WDT_KEEPALIVE, RT_NULL);

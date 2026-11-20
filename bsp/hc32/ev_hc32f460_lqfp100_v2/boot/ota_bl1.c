@@ -6,6 +6,7 @@
 #include "ota_layout.h"
 #include "ota_jump.h"
 #include "ota_bl2_digest.h"
+#include "ota_watchdog.h"
 
 static const uint8_t expected[32] = NTN_OTA_BL2_DIGEST;
 
@@ -21,6 +22,7 @@ static bool wait_tx(uint32_t flag)
 static void report_failure(const char *message)
 {
     stc_usart_uart_init_t config;
+    SystemCoreClockUpdate();
     GPIO_REG_Unlock();
     GPIO_SetFunc(GPIO_PORT_A, GPIO_PIN_01, GPIO_FUNC_32);
     GPIO_REG_Lock();
@@ -46,6 +48,7 @@ int main(void)
     int result;
 
     __disable_irq();
+    ntn_ota_feed_watchdog();
     PWC_FCG0_REG_Unlock();
     FCG_Fcg0PeriphClockCmd(FCG0_PERIPH_HASH, ENABLE);
     result = HASH_Calculate((const uint8_t *)NTN_OTA_BL2_BASE,
@@ -60,7 +63,10 @@ int main(void)
         if (mismatch == 0)
         {
             if (ntn_ota_vector_valid(NTN_OTA_BL2_BASE, NTN_OTA_BL2_BASE + NTN_OTA_BL2_SIZE))
+            {
+                ntn_ota_feed_watchdog();
                 ntn_ota_jump(NTN_OTA_BL2_BASE);
+            }
             report_failure("BOOT1 ERROR BL2_VECTOR\r\n");
         }
         else
