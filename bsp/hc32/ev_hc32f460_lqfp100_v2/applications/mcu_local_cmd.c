@@ -13,6 +13,10 @@
 #include <rthw.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef NTN_OTA_APP
+#include "ota_app.h"
+#include "ota_mailbox.h"
+#endif
 
 #define MCU_CMD_COPY_MAX  384U
 
@@ -97,7 +101,14 @@ static rt_bool_t handle_capability(const char *cmd, char *out, rt_size_t out_siz
     rt_snprintf(out, out_size,
                 "\r\n+MCUCAP:{\"udp\":true,\"domain\":true,\"rx_query\":true,"
                 "\"rx_push\":true,\"rx_push_verified\":false,"
-                "\"downlink_to_rs232\":false,\"upgrade\":false,\"raw_max\":256}\r\nOK\r\n");
+                "\"downlink_to_rs232\":false,"
+#ifdef NTN_OTA_APP
+                "\"upgrade\":true,\"ota_layout\":%u,\"boot_abi\":%u,\"recovery_baud\":19200,"
+                "\"ota_max\":%u,\"raw_max\":256}\r\nOK\r\n",
+                NTN_OTA_LAYOUT_ID, NTN_OTA_BOOT_ABI, NTN_OTA_PACKAGE_MAX);
+#else
+                "\"upgrade\":false,\"raw_max\":256}\r\nOK\r\n");
+#endif
     return RT_TRUE;
 }
 
@@ -1027,6 +1038,27 @@ static rt_bool_t handle_power_stub(const char *cmd, char *out, rt_size_t out_siz
 static rt_bool_t handle_reboot(const char *cmd, char *out, rt_size_t out_size,
                                mcu_cmd_action_t *action)
 {
+#ifdef NTN_OTA_APP
+    if (cmd_is_query(cmd, "AT+MCUOTASTAT"))
+    {
+        char build_id[33];
+        ntn_ota_get_build_id(build_id);
+        rt_snprintf(out, out_size, "\r\n+MCUOTASTAT:{\"build\":\"%s\",\"confirmed\":%s}\r\nOK\r\n",
+                    build_id, ntn_ota_is_confirmed() ? "true" : "false");
+        return RT_TRUE;
+    }
+    if (rt_strcmp(cmd, "AT+MCUOTA=BOOT") == 0)
+    {
+        if (!ntn_ota_is_confirmed())
+        {
+            cmd_error(out, out_size, 2);
+            return RT_TRUE;
+        }
+        action->type = MCU_CMD_ACTION_OTA_BOOT;
+        rt_snprintf(out, out_size, "\r\n+MCUOTA:{\"state\":\"REBOOTING\"}\r\nOK\r\n");
+        return RT_TRUE;
+    }
+#endif
     if (rt_strcmp(cmd, "AT+MCUREBOOT") != 0) return RT_FALSE;
     action->type = MCU_CMD_ACTION_REBOOT;
     rt_snprintf(out, out_size,
@@ -1036,10 +1068,15 @@ static rt_bool_t handle_reboot(const char *cmd, char *out, rt_size_t out_size,
 
 void mcu_local_cmd_apply_reboot(const mcu_cmd_action_t *action)
 {
-    if (action != RT_NULL && action->type == MCU_CMD_ACTION_REBOOT)
+    if (action != RT_NULL && (action->type == MCU_CMD_ACTION_REBOOT ||
+                              action->type == MCU_CMD_ACTION_OTA_BOOT))
     {
         /* Let the response drain even at the minimum supported 9600 baud. */
         rt_thread_mdelay(500U);
+#ifdef NTN_OTA_APP
+        if (action->type == MCU_CMD_ACTION_OTA_BOOT)
+            ntn_ota_request_boot();
+#endif
         rt_hw_cpu_reset();
     }
 }

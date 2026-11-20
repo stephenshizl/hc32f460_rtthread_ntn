@@ -1,0 +1,18 @@
+#! armcc -E
+#include "ota_layout.h"
+LR_BL1 NTN_OTA_BL1_BASE NTN_OTA_BL1_SIZE {
+    ER_VECTORS NTN_OTA_BL1_BASE NTN_OTA_ICG_ADDR {
+        *.o (RESET, +First)
+    }
+    ER_ICG NTN_OTA_ICG_ADDR FIXED NTN_OTA_ICG_SIZE {
+        hc32_ll_icg.o (.ARM.__at_0x00000400)
+    }
+    ER_BOOT (NTN_OTA_ICG_ADDR + NTN_OTA_ICG_SIZE) {
+        *(InRoot$$Sections)
+        .ANY (+RO)
+        .ANY (+XO)
+    }
+    RW_RAM (NTN_OTA_MAILBOX + NTN_OTA_MAILBOX_SIZE) 0x2EFE8 {
+        .ANY (+RW +ZI)
+    }
+}

@@ -40,5 +40,7 @@
 #define NTN_OTA_MAILBOX         0x1FFF8008
 #define NTN_OTA_MAILBOX_SIZE    0x10
 #define NTN_OTA_PACKAGE_MAX     (NTN_OTA_SLOT_SIZE - NTN_OTA_TRAILER_MAX)
+/* MCUboot 2.4 scratch with default BOOT_MAX_ALIGN (8) and 16-byte magic. */
+#define NTN_OTA_IMAGE_OK_OFF    (NTN_OTA_SLOT_SIZE - 24)
 
 #endif

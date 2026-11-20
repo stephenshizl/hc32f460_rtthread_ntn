@@ -1,0 +1,10 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+#ifndef NTN_SYSFLASH_H
+#define NTN_SYSFLASH_H
+#define FLASH_AREA_IMAGE_PRIMARY(x) 1
+#define FLASH_AREA_IMAGE_SECONDARY(x) 2
+#define FLASH_AREA_IMAGE_SCRATCH 3
+#define NTN_AREA_FACTORY 4
+#define NTN_FLASH_INTERNAL 0
+#define NTN_FLASH_NOR 1
+#endif

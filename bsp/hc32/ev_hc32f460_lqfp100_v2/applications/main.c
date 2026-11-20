@@ -17,6 +17,10 @@
 #include "pc_rs232.h"
 #include "param_manager.h"
 #include "mcu_local_cmd.h"
+#ifdef NTN_OTA_APP
+#include "ota_app.h"
+#include "store_forward.h"
+#endif
 
 #ifdef RT_USING_FINSH
 #include <finsh.h>
@@ -40,6 +44,10 @@ MSH_CMD_EXPORT(sys_reboot, Reboot MCU system in 500 ms and retain saved NV);
 int main(void)
 {
     char boot_log[192];
+#ifdef NTN_OTA_APP
+    rt_tick_t ota_started = rt_tick_get();
+    bool ota_confirmed = ntn_ota_is_confirmed();
+#endif
 
     rt_kprintf("\r\n[SYS] NTN System Main Thread Started...\r\n");
     /* One boot record on the customer port, after the PC router is initialized. */
@@ -54,6 +62,16 @@ int main(void)
 
     while (1)
     {
+#ifdef NTN_OTA_APP
+        if (!ota_confirmed && rt_tick_get() - ota_started >= rt_tick_from_millisecond(3000U))
+        {
+            if (store_forward_is_ready() && rt_device_find(RS232_UART_NAME) &&
+                pc_rs232_get_baudrate() != 0U)
+                ota_confirmed = ntn_ota_confirm();
+            if (!ota_confirmed && rt_tick_get() - ota_started >= rt_tick_from_millisecond(60000U))
+                rt_hw_cpu_reset();
+        }
+#endif
         /* Reflect NTN network status pin on NET_OK LED */
         hw_led_net_set(hw_ntn_status_get() ? RT_TRUE : RT_FALSE);
 
