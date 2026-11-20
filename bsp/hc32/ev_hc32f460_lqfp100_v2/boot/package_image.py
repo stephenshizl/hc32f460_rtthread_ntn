@@ -115,6 +115,15 @@ def main():
                 "size": factory.stat().st_size, "sha256": hashlib.sha256(factory.read_bytes()).hexdigest()},
     }
     (GEN / "ntn-ota-l0.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="ascii")
+    from flash_project import generate
+    targets = {"ALL": "ntn-ota-l0.hex"}
+    for entry in manifest["onchip"]:
+        start = entry["offset"]
+        name = entry["name"]
+        filename = f"flash-{name}.hex"
+        flash[start:start + entry["size"]].write_hex_file(str(GEN / filename))
+        targets["APP" if name == "primary" else name.upper()] = filename
+    generate(targets)
 
 
 if __name__ == "__main__":
