@@ -299,7 +299,7 @@ int ntn_ota_serial(unsigned listen_ms, const char *status)
     }
     if (boot_set_pending(0))
     {
-        const char *error = "ERROR TEST_MARK\r\n";
+        const char *error = ntn_ota_last_power_fault() ? "ERROR LOW_POWER\r\n" : "ERROR TEST_MARK\r\n";
         send_bytes(port, error, strlen(error));
         goto close;
     }

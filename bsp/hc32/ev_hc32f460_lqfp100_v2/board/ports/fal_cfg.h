@@ -18,6 +18,10 @@
 #define FAL_FLASH_PORT_DRIVER_HC32F4
 /* enable SFUD flash driver sample */
 #define FAL_FLASH_PORT_DRIVER_SFUD
+#if defined(NTN_OTA_APP) || defined(NTN_OTA_BL2)
+#include "ota_power.h"
+#define FAL_NOR_VOLTAGE_OK() ntn_ota_voltage_ok()
+#endif
 
 extern const struct fal_flash_dev hc32_onchip_flash;
 extern struct fal_flash_dev ext_nor_flash0;

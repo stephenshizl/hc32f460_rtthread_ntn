@@ -84,6 +84,18 @@ bool ntn_ota_check_image(const struct flash_area *area, uint32_t received)
 
     if (extent == 0)
         return false;
+    /* Admission applies to incoming packages. An installed older primary can
+     * still boot or revert while an L0 fixture is migrating generations. */
+    if (area->fa_id != FLASH_AREA_IMAGE_PRIMARY(0))
+    {
+        uint32_t abi;
+        if (flash_area_read(area, NTN_OTA_HEADER_SIZE + NTN_OTA_DESCRIPTOR_OFF + 24U,
+                            &abi, sizeof(abi)) || abi != NTN_OTA_BOOT_ABI)
+        {
+            ntn_ota_log_error("DOWNLOAD_BOOT_ABI");
+            return false;
+        }
+    }
     if (extent != received)
     {
         ntn_ota_log_error("DOWNLOAD_LENGTH_MISMATCH");
@@ -195,38 +207,6 @@ int default_CSPRNG(uint8_t *dest, unsigned int size)
     return 0;
 }
 
-/* Independent on-chip verification when external NOR is absent or uninitialized.
- * Uses only internal primary slot flash_area_read() + static flash geometry (zero NOR I/O).
- * Requires confirmed primary trailer (excludes unconfirmed trials and active half-swaps),
- * product/vector compatibility, and full ECDSA-P256 + SHA-256 signature verification. */
-static bool primary_confirmed_without_nor(void)
-{
-    const struct flash_area *primary;
-    struct boot_swap_state swap_state;
-    struct image_header hdr;
-    uint32_t extent;
-
-    if (flash_area_open(FLASH_AREA_IMAGE_PRIMARY(0), &primary) != 0)
-        return false;
-    if (boot_read_swap_state_by_id(FLASH_AREA_IMAGE_PRIMARY(0), &swap_state) != 0 ||
-        swap_state.magic != BOOT_MAGIC_GOOD ||
-        swap_state.image_ok != BOOT_FLAG_SET ||
-        (swap_state.copy_done != BOOT_FLAG_SET && swap_state.copy_done != BOOT_FLAG_UNSET))
-    {
-        flash_area_close(primary);
-        return false;
-    }
-    extent = image_extent(primary, &hdr);
-    if (extent == 0 || !ntn_ota_check_image(primary, extent) ||
-        !ntn_ota_vector_valid(NTN_OTA_APP_VECTOR, NTN_OTA_APP_VECTOR + hdr.ih_img_size))
-    {
-        flash_area_close(primary);
-        return false;
-    }
-    flash_area_close(primary);
-    return true;
-}
-
 static void handoff(void)
 {
     unsigned i;
@@ -297,7 +277,6 @@ int main(void)
     FIH_DECLARE(result, FIH_FAILURE);
     int request = ntn_ota_take_boot_request();
     ntn_ota_feed_watchdog();
-    (void)ntn_ota_power_init();
     if (app_flash_init() == RT_EOK)
     {
         FIH_CALL(boot_go, result, &response);
@@ -330,11 +309,8 @@ int main(void)
             rt_thread_mdelay(10);
         }
     }
-    if (primary_confirmed_without_nor())
-    {
-        ntn_ota_report_boot_error("BOOT2 WARN NOR_INIT_FALLBACK_PRIMARY\r\n");
-        handoff();
-    }
+    /* Scratch can hold the only authoritative swap record. Without NOR the
+     * primary trailer alone cannot prove that there is no interrupted swap. */
     ntn_ota_report_boot_error("BOOT2 ERROR NOR_INIT\r\n");
     for (;;)
         rt_thread_mdelay(1000);

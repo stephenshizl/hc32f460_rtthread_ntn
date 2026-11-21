@@ -96,7 +96,15 @@ def main():
     if der not in bl2:
         raise ValueError("BL2 was built for a different App signing key")
     initial = GEN / "app.confirmed.bin"
-    imgtool(*sign_options, "--pad", "--confirm", GEN / "app-body.bin", initial)
+    # Preserve the exact signed envelope in all delivery formats. Use the
+    # pinned imgtool layout for the erased padding, image_ok and trailer magic.
+    sys.path.insert(0, str(MCUBOOT / "scripts"))
+    from imgtool.image import Image
+    padded = Image(align=4, slot_size=slot, max_sectors=128, confirm=True)
+    padded.payload = bytearray(compact.read_bytes())
+    padded.pad_to(slot)
+    initial.write_bytes(padded.payload)
+    imgtool("verify", "--key", args.public_key, initial)
     if initial.stat().st_size != slot:
         raise ValueError("Unexpected primary slot length")
     flash = IntelHex()

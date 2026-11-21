@@ -155,26 +155,28 @@ rt_bool_t task_wdt_is_all_healthy(void)
 
 rt_bool_t task_wdt_is_confirmed_healthy(void)
 {
-    rt_bool_t rs232_alive = RT_FALSE;
-    rt_uint32_t active_tasks = 0U;
+    static const char *const required[] = {"rs232", "ntn", "ble", "gnss"};
+    rt_bool_t healthy = RT_TRUE;
 
-    if (!s_wdt_init_ok || !s_global_enabled || s_healthy_rounds < 3U)
-    {
+    if (!s_wdt_init_ok)
         return RT_FALSE;
-    }
     rt_mutex_take(&s_wdt_lock, RT_WAITING_FOREVER);
-    for (int i = 0; i < TASK_WDT_MAX_TASKS; i++)
+    for (rt_size_t r = 0; r < sizeof(required) / sizeof(required[0]); ++r)
     {
-        if (s_tasks[i].is_used && s_tasks[i].is_enabled)
+        int i;
+        for (i = 0; i < TASK_WDT_MAX_TASKS; ++i)
         {
-            active_tasks++;
-            if (rt_strcmp(s_tasks[i].name, "rs232") == 0 && s_tasks[i].heartbeat_count > 0U)
-            {
-                rs232_alive = RT_TRUE;
-            }
+            if (s_tasks[i].is_used && s_tasks[i].is_enabled &&
+                s_tasks[i].heartbeat_count && rt_strcmp(s_tasks[i].name, required[r]) == 0)
+                break;
+        }
+        if (i == TASK_WDT_MAX_TASKS)
+        {
+            healthy = RT_FALSE;
+            break;
         }
     }
-    rt_bool_t healthy = (active_tasks > 0U) && rs232_alive && task_wdt_is_all_healthy();
+    healthy = healthy && s_global_enabled && s_healthy_rounds >= 3U && task_wdt_is_all_healthy();
     rt_mutex_release(&s_wdt_lock);
     return healthy;
 }

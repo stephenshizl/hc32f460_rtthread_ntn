@@ -51,7 +51,6 @@ int main(void)
     rt_tick_t ota_started = rt_tick_get();
     bool ota_confirmed;
     ntn_ota_feed_watchdog();
-    (void)ntn_ota_power_init();
     ota_confirmed = ntn_ota_is_confirmed();
 #endif
 

@@ -10,6 +10,9 @@
  */
 
 #include "board.h"
+#if defined(NTN_OTA_APP) || defined(NTN_OTA_BL2)
+#include "ota_power.h"
+#endif
 #include "board_config.h"
 
 /* unlock/lock peripheral */
@@ -201,6 +204,8 @@ void PeripheralClock_Config(void)
 #endif
 
 #if defined(NTN_OTA_APP) || defined(NTN_OTA_BL2)
+    /* Initialize the voltage monitor before RT-Thread device and storage init. */
+    (void)ntn_ota_power_init();
     /* Seal on-chip Flash write window (end < start => all-deny) and lock EFM. */
     EFM_FWMC_Cmd(DISABLE);
     EFM_SetWindowProtectAddr(0x0007E000UL, 0x00000000UL);

@@ -80,12 +80,7 @@ bool ntn_ota_voltage_ok(void)
 {
     /* RM Rev1.71 p.161: PVD1MON reads 1 when PVD1 is disabled OR VCC > VPVD1.
      * Require monitor enable, comparator enable, expected threshold, stabilization, AND MON == 1. */
-    if (!s_lvd_ready && !ntn_ota_power_init())
-    {
-        s_low_power_fault = true;
-        return false;
-    }
-    if ((CM_PWC->PVDCR0 & PWC_PVDCR0_PVD1EN) == 0U ||
+    if (!s_lvd_ready || (CM_PWC->PVDCR0 & PWC_PVDCR0_PVD1EN) == 0U ||
         (CM_PWC->PVDCR1 & PWC_PVDCR1_PVD1CMPOE) == 0U ||
         ((CM_PWC->PVDLCR & PWC_PVDLCR_PVD1LVL) != NTN_OTA_LVD_THRESHOLD) ||
         PWC_LVD_GetStatus(PWC_LVD1_FLAG_MON) != SET)
@@ -177,7 +172,7 @@ static int internal_mutate(const struct flash_area *area, uint32_t off,
     irq = __get_PRIMASK();
     __disable_irq();
     EFM_REG_Unlock();
-    prev_cache = CM_EFM->FRMC & EFM_CACHE_ALL;
+    prev_cache = CM_EFM->FRMC & EFM_FRMC_CACHE;
     EFM_CacheCmd(DISABLE);
     /* Narrow hardware write window to exact target range; FPMTEW = end - 1 ensures
      * FPMTEW > FPMTSW (never equal => full unlock) and blocks adjacent address `end`. */

@@ -60,7 +60,8 @@ static int read(long offset, rt_uint8_t *buf, rt_size_t size)
 {
     RT_ASSERT(sfud_dev);
     RT_ASSERT(sfud_dev->init_ok);
-    sfud_read(sfud_dev, ext_nor_flash0.addr + offset, size, buf);
+    if (sfud_read(sfud_dev, ext_nor_flash0.addr + offset, size, buf) != SFUD_SUCCESS)
+        return -1;
 
     return size;
 }
@@ -69,10 +70,25 @@ static int write(long offset, const rt_uint8_t *buf, rt_size_t size)
 {
     RT_ASSERT(sfud_dev);
     RT_ASSERT(sfud_dev->init_ok);
+#ifdef FAL_NOR_VOLTAGE_OK
+    rt_size_t done = 0;
+    while (done < size)
+    {
+        uint32_t address = ext_nor_flash0.addr + offset + done;
+        /* BY25Q64ES page programming cannot cross a 256-byte boundary. */
+        rt_size_t chunk = 256U - (address & 255U);
+        if (chunk > size - done)
+            chunk = size - done;
+        if (!FAL_NOR_VOLTAGE_OK() || sfud_write(sfud_dev, address, chunk, buf + done) != SFUD_SUCCESS)
+            return -1;
+        done += chunk;
+    }
+#else
     if (sfud_write(sfud_dev, ext_nor_flash0.addr + offset, size, buf) != SFUD_SUCCESS)
     {
         return -1;
     }
+#endif
 
     return size;
 }
@@ -81,10 +97,25 @@ static int erase(long offset, rt_size_t size)
 {
     RT_ASSERT(sfud_dev);
     RT_ASSERT(sfud_dev->init_ok);
+#ifdef FAL_NOR_VOLTAGE_OK
+    rt_size_t done = 0;
+    while (done < size)
+    {
+        uint32_t address = ext_nor_flash0.addr + offset + done;
+        /* One aligned erase sector per voltage decision. */
+        rt_size_t chunk = ext_nor_flash0.blk_size - (address % ext_nor_flash0.blk_size);
+        if (chunk > size - done)
+            chunk = size - done;
+        if (!FAL_NOR_VOLTAGE_OK() || sfud_erase(sfud_dev, address, chunk) != SFUD_SUCCESS)
+            return -1;
+        done += chunk;
+    }
+#else
     if (sfud_erase(sfud_dev, ext_nor_flash0.addr + offset, size) != SFUD_SUCCESS)
     {
         return -1;
     }
+#endif
 
     return size;
 }

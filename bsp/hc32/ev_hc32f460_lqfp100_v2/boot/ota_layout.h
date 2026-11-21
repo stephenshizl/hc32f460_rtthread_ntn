@@ -5,7 +5,7 @@
 #define NTN_OTA_LAYOUT_H
 
 #define NTN_OTA_LAYOUT_ID       1
-#define NTN_OTA_BOOT_ABI        1
+#define NTN_OTA_BOOT_ABI        2
 #define NTN_OTA_PRODUCT_ID      0x314E544E
 #define NTN_OTA_HW_REV          1
 #define NTN_OTA_BL1_BASE        0x00000000
