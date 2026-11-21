@@ -1,0 +1,58 @@
+HC32F460 BL1 + BL2 + App 整机发布分步操作说明
+
+工作目录：
+F:\work-2026\work_code\rt-thread\bsp\hc32\ev_hc32f460_lqfp100_v2
+
+说明：三个 Keil 工程分别是 ntn-ota-bl1.uvprojx、ntn-ota-bl2.uvprojx、ntn-ota-app.uvprojx。
+project.uvprojx 是原始业务工程，不参与本整机安全启动发布。
+
+1. 生成新的 Build ID。Git Bash：
+python -c "import secrets; print(secrets.token_hex(16))"
+
+1. 生成新的 Build ID。PowerShell：
+[guid]::NewGuid().ToString('N')
+
+假设本次得到 Build ID：91fc64cf7b2443eaa7fdbb6026112006。以下全部替换成实际生成的值。
+
+2. 在编译前生成本次 App 和 BL2 配置。Git Bash：
+python ./boot/prepare_mdk.py --build-id 91fc64cf7b2443eaa7fdbb6026112006 --public-key ./build/ntn-ota/dev-public.pem
+
+2. PowerShell：
+python .\boot\prepare_mdk.py --build-id 91fc64cf7b2443eaa7fdbb6026112006 --public-key .\build\ntn-ota\dev-public.pem
+
+3. 在 Keil 打开 ntn-ota-bl2.uvprojx，点击 Project -> Rebuild all target files。确认日志为 0 Error(s)。
+
+4. 从已编译 BL2 提取准确二进制。Git Bash：
+python ./boot/package_image.py extract-bl2
+
+4. PowerShell：
+python .\boot\package_image.py extract-bl2
+
+5. 生成 BL1 对本次 BL2 的 SHA-256 信任摘要。Git Bash：
+python ./boot/prepare_mdk.py --bl2-bin ./build/ntn-ota/bl2.bin --watchdog
+
+5. PowerShell：
+python .\boot\prepare_mdk.py --bl2-bin .\build\ntn-ota\bl2.bin --watchdog
+
+6. 在 Keil 打开 ntn-ota-bl1.uvprojx，点击 Project -> Rebuild all target files。确认日志为 0 Error(s)。
+
+7. 在 Keil 打开 ntn-ota-app.uvprojx，点击 Project -> Rebuild all target files。确认日志为 0 Error(s)。
+
+8. 签名并打包整机发布物。Git Bash：
+python ./boot/package_image.py provision --version 1.0.6 --key ./build/ntn-ota/dev-private.pem --public-key ./build/ntn-ota/dev-public.pem
+
+8. PowerShell：
+python .\boot\package_image.py provision --version 1.0.6 --key .\build\ntn-ota\dev-private.pem --public-key .\build\ntn-ota\dev-public.pem
+
+9. 确认以下文件生成：
+build\ntn-ota\ntn-ota-l0.hex
+build\ntn-ota\app.signed.bin
+build\ntn-ota\app.confirmed.bin
+build\ntn-ota\factory.signed.bin
+build\ntn-ota\ntn-ota-l0.json
+
+10. 工厂 J-Flash 下载使用 build\ntn-ota\ntn-ota-l0.hex。它一次烧录 BL1、BL2 和已确认 App。
+
+11. 网页或 RS232 升级使用 build\ntn-ota\app.signed.bin。
+
+12. 当前 factory.signed.bin 不需要 J-Flash 写入 MCU 片内。它是预留给外挂 NOR factory 分区 0x080000 的恢复副本，待外挂 NOR 工装完成后再使用。

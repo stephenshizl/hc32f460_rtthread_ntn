@@ -1,0 +1,29 @@
+HC32F460 BL1 + BL2 + App 整机发布一键操作说明
+
+适用场景：BL1、BL2、App 都可能修改，需要重新生成工厂 J-Flash 整机包。
+
+当前测试密钥：
+build\ntn-ota\dev-private.pem
+build\ntn-ota\dev-public.pem
+
+Build ID 是 32 位十六进制的固件唯一身份。91fc64cf7b2443eaa7fdbb6026112006 是当前 1.0.6 的 Build ID。
+它不属于版本号、密钥或地址。每个新发布版本生成一个新的 Build ID。
+
+Git Bash：在 BSP 根目录执行下面一条命令。
+./boot/release_all.sh --version 1.0.6 --build-id 91fc64cf7b2443eaa7fdbb6026112006 --private-key ./build/ntn-ota/dev-private.pem --public-key ./build/ntn-ota/dev-public.pem
+
+PowerShell：在 BSP 根目录执行下面一条命令。
+.\boot\release_all.ps1 -Version 1.0.6 -BuildId 91fc64cf7b2443eaa7fdbb6026112006 -PrivateKey .\build\ntn-ota\dev-private.pem -PublicKey .\build\ntn-ota\dev-public.pem
+
+脚本自动完成：生成 App/BL2 配置，编译 BL2，生成 BL1 对 BL2 的 SHA-256 信任摘要，编译 BL1，编译 App，签名 App，生成整机包。
+
+成功后工厂 J-Flash 只使用下面一个文件：
+build\ntn-ota\ntn-ota-l0.hex
+
+该 HEX 自带地址：BL1 为 0x00000000，BL2 为 0x00004000，已确认 App 为 0x00020000。
+J-Flash 直接加载 HEX，不要以 BIN 方式手动填写起始地址。
+
+网页和 RS232 日常 App 升级使用：
+build\ntn-ota\app.signed.bin
+
+factory.signed.bin 是外挂 NOR 的恢复副本。当前工装尚未自动写入外挂 NOR，不能替代 ntn-ota-l0.hex 的首装流程。
