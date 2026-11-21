@@ -3,6 +3,8 @@ HC32F460 BL1 + BL2 + App 整机发布分步操作说明
 工作目录：
 F:\work-2026\work_code\rt-thread\bsp\hc32\ev_hc32f460_lqfp100_v2
 
+以下所有 Git Bash、PowerShell 和 Python 命令均在此目录执行。Build ID 生成命令本身可在任意目录运行，但发布操作统一在此目录完成。
+
 说明：三个 Keil 工程分别是 ntn-ota-bl1.uvprojx、ntn-ota-bl2.uvprojx、ntn-ota-app.uvprojx。
 project.uvprojx 是原始业务工程，不参与本整机安全启动发布。
 

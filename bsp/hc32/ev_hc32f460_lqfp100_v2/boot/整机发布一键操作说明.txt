@@ -6,6 +6,8 @@ HC32F460 BL1 + BL2 + App 整机发布一键操作说明
 build\ntn-ota\dev-private.pem
 build\ntn-ota\dev-public.pem
 
+执行目录统一为 BSP 根目录：F:\work-2026\work_code\rt-thread\bsp\hc32\ev_hc32f460_lqfp100_v2。
+
 Build ID 是 32 位十六进制的固件唯一身份。91fc64cf7b2443eaa7fdbb6026112006 是当前 1.0.6 的 Build ID。
 它不属于版本号、密钥、地址或 Git 提交号。不要从 git log 复制。
 每个新发布版本生成一个新的 Build ID。Git Bash：python -c "import secrets; print(secrets.token_hex(16))"
