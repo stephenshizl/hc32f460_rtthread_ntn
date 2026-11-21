@@ -53,6 +53,25 @@ build\ntn-ota\ntn-ota-l0.json
 
 10. 工厂 J-Flash 下载使用 build\ntn-ota\ntn-ota-l0.hex。它一次烧录 BL1、BL2 和已确认 App。
 
+10.1 Keil 也可使用 build\ntn-ota\flash.uvprojx。打开工程后，在顶部 Target 下拉框选择 ALL，点击 Flash -> Download。
+ALL 调用 download-ALL.cmd，使用 ntn-ota-l0.hex 写入并回读校验 BL1、BL2、已确认 App。
+APP 调用 flash-primary.hex，只写已确认 App；BL1 和 BL2 Target 只写相应 Bootloader。
+flash.uvprojx、download-*.cmd、flash_station.py、ntn-ota-l0.hex 和 flash-*.hex 必须保持在 build\ntn-ota 同一目录。
+
 11. 网页或 RS232 升级使用 build\ntn-ota\app.signed.bin。
 
 12. 当前 factory.signed.bin 不需要 J-Flash 写入 MCU 片内。它是预留给外挂 NOR factory 分区 0x080000 的恢复副本，待外挂 NOR 工装完成后再使用。
+
+13. 当前 dev-private.pem 和 dev-public.pem 是测试密钥。测试阶段已纳入 Git，正式量产不能继续使用。
+
+14. 在受控签名机生成正式 P-256 密钥。Git Bash：
+mkdir -p /f/secure-signing && openssl ecparam -name prime256v1 -genkey -noout -out /f/secure-signing/ntn-prod-private.pem && openssl ec -in /f/secure-signing/ntn-prod-private.pem -pubout -out /f/secure-signing/ntn-prod-public.pem
+
+14. PowerShell：
+New-Item -ItemType Directory -Force F:\secure-signing | Out-Null; openssl ecparam -name prime256v1 -genkey -noout -out F:\secure-signing\ntn-prod-private.pem; openssl ec -in F:\secure-signing\ntn-prod-private.pem -pubout -out F:\secure-signing\ntn-prod-public.pem
+
+15. 正式私钥只能保留在受控签名机或密钥管理设备，不能加入 Git、发布包、J-Flash 工装和普通开发机。正式公钥可进入 BL2。
+
+16. 首次使用正式公钥时，回到第 2 步，将 public-key 改成 F:\secure-signing\ntn-prod-public.pem，然后完整执行第 3 至第 8 步。原因是 BL2 必须编入正式公钥，BL1 必须重新写入新 BL2 的 SHA-256 摘要。
+
+17. 第 8 步正式签名时，将 key 改成 F:\secure-signing\ntn-prod-private.pem，将 public-key 改成 F:\secure-signing\ntn-prod-public.pem。

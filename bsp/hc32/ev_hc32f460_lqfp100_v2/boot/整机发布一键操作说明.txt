@@ -23,7 +23,28 @@ build\ntn-ota\ntn-ota-l0.hex
 该 HEX 自带地址：BL1 为 0x00000000，BL2 为 0x00004000，已确认 App 为 0x00020000。
 J-Flash 直接加载 HEX，不要以 BIN 方式手动填写起始地址。
 
+Keil 下载工装工程：
+build\ntn-ota\flash.uvprojx
+
+flash.uvprojx 的作用是调用同目录 download-*.cmd 和 flash_station.py，通过 J-Link 写入并回读校验发布 HEX。
+打开后，Keil 顶部 Target 下拉框选择 ALL，再点击 Flash -> Download，即下载 BL1 + BL2 + 已确认 App。
+选择 APP 下载 flash-primary.hex；选择 BL1 或 BL2 下载对应分区 HEX。
+flash.uvprojx 必须与同目录的 ntn-ota-l0.hex、flash-*.hex、download-*.cmd、flash_station.py 保持在一起。
+
 网页和 RS232 日常 App 升级使用：
 build\ntn-ota\app.signed.bin
 
 factory.signed.bin 是外挂 NOR 的恢复副本。当前工装尚未自动写入外挂 NOR，不能替代 ntn-ota-l0.hex 的首装流程。
+
+正式密钥：当前 dev-private.pem 和 dev-public.pem 仅用于测试，已经按测试阶段要求纳入 Git。
+正式私钥不能进入 Git、发布 ZIP、J-Flash 工装或普通开发电脑；只保留在受控签名机或密钥管理设备。
+
+正式密钥生成 Git Bash 一条命令：
+mkdir -p /f/secure-signing && openssl ecparam -name prime256v1 -genkey -noout -out /f/secure-signing/ntn-prod-private.pem && openssl ec -in /f/secure-signing/ntn-prod-private.pem -pubout -out /f/secure-signing/ntn-prod-public.pem
+
+正式密钥生成 PowerShell 一条命令：
+New-Item -ItemType Directory -Force F:\secure-signing | Out-Null; openssl ecparam -name prime256v1 -genkey -noout -out F:\secure-signing\ntn-prod-private.pem; openssl ec -in F:\secure-signing\ntn-prod-private.pem -pubout -out F:\secure-signing\ntn-prod-public.pem
+
+首次切换正式公钥时，必须用正式公钥重新执行完整 BL2 -> BL1 -> App -> provision 流程。BL2 编入正式公钥，BL1 编入新 BL2 的 SHA-256 摘要。
+Git Bash 正式发布脚本参数使用：--private-key /f/secure-signing/ntn-prod-private.pem --public-key /f/secure-signing/ntn-prod-public.pem。
+PowerShell 正式发布脚本参数使用：-PrivateKey F:\secure-signing\ntn-prod-private.pem -PublicKey F:\secure-signing\ntn-prod-public.pem。
