@@ -33,6 +33,7 @@ typedef struct
     char        name[TASK_WDT_NAME_MAX_LEN];    /* Human-readable task name */
     rt_uint32_t timeout_sec;                    /* Allowed maximum silence duration in seconds */
     rt_tick_t   last_heartbeat_tick;            /* System tick of last received heartbeat */
+    rt_uint32_t heartbeat_count;                /* Number of real heartbeats observed since init */
     rt_bool_t   is_used;                        /* Slot occupied flag */
     rt_bool_t   is_enabled;                     /* Active monitoring flag */
     rt_bool_t   is_hung;                        /* Hung/deadlock detected flag */
@@ -77,6 +78,12 @@ void task_wdt_set_enable(task_wdt_id_t id, rt_bool_t enable);
  * @return RT_TRUE if healthy, RT_FALSE if any task has hung
  */
 rt_bool_t task_wdt_is_all_healthy(void);
+
+/**
+ * @brief Check if watchdog supervision completed healthy rounds with core task heartbeats
+ * @return RT_TRUE once supervisor daemon and core tasks prove active health
+ */
+rt_bool_t task_wdt_is_confirmed_healthy(void);
 
 #ifdef __cplusplus
 }

@@ -19,7 +19,10 @@
 #include "mcu_local_cmd.h"
 #ifdef NTN_OTA_APP
 #include "ota_app.h"
+#include "ota_power.h"
+#include "ota_watchdog.h"
 #include "store_forward.h"
+#include "task_wdt.h"
 #endif
 
 #ifdef RT_USING_FINSH
@@ -46,7 +49,10 @@ int main(void)
     char boot_log[192];
 #ifdef NTN_OTA_APP
     rt_tick_t ota_started = rt_tick_get();
-    bool ota_confirmed = ntn_ota_is_confirmed();
+    bool ota_confirmed;
+    ntn_ota_feed_watchdog();
+    (void)ntn_ota_power_init();
+    ota_confirmed = ntn_ota_is_confirmed();
 #endif
 
     rt_kprintf("\r\n[SYS] NTN System Main Thread Started...\r\n");
@@ -63,10 +69,10 @@ int main(void)
     while (1)
     {
 #ifdef NTN_OTA_APP
-        if (!ota_confirmed && rt_tick_get() - ota_started >= rt_tick_from_millisecond(3000U))
+        if (!ota_confirmed && rt_tick_get() - ota_started >= rt_tick_from_millisecond(6000U))
         {
-            if (store_forward_is_ready() && rt_device_find(RS232_UART_NAME) &&
-                pc_rs232_get_baudrate() != 0U)
+            if (task_wdt_is_confirmed_healthy() && store_forward_is_ready() &&
+                rt_device_find(RS232_UART_NAME) && pc_rs232_get_baudrate() != 0U)
                 ota_confirmed = ntn_ota_confirm();
             if (!ota_confirmed && rt_tick_get() - ota_started >= rt_tick_from_millisecond(60000U))
                 rt_hw_cpu_reset();

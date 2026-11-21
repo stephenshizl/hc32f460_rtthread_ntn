@@ -7,6 +7,7 @@
 #include <rtthread.h>
 #include <rtdevice.h>
 #include "ota_layout.h"
+#include "ota_power.h"
 #include "ota_serial.h"
 #include "ota_watchdog.h"
 #include "flash_map_backend/flash_map_backend.h"
@@ -145,7 +146,16 @@ static bool receive_file(rt_device_t port, const struct flash_area *area, uint32
         int code = read_byte(port, 3000);
         unsigned size;
         if (code == CAN)
-            return false;
+        {
+            /* Standard YMODEM cancel requires two consecutive CAN bytes; preserve
+             * any valid control byte arriving after a stray single CAN. */
+            int next = read_byte(port, 1000);
+            if (next == CAN)
+                return false;
+            if (next != SOH && next != STX && next != EOT)
+                continue;
+            code = next;
+        }
         if (code == EOT && phase >= 1 && written == length)
         {
             if (phase++ == 1)
@@ -254,6 +264,7 @@ int ntn_ota_serial(unsigned listen_ms, const char *status)
     if (!read_line(port, line, sizeof(line), listen_ms) || strcmp(line, "NTN-MCU-OTA/1 HELLO"))
         goto close;
     send_boot_log(port, status);
+    last_error[0] = 0;
     rt_snprintf(line, sizeof(line), "READY %u %u %u\r\n",
                 NTN_OTA_BOOT_ABI, NTN_OTA_LAYOUT_ID, NTN_OTA_PACKAGE_MAX);
     if (!send_bytes(port, line, strlen(line)) ||
@@ -261,15 +272,22 @@ int ntn_ota_serial(unsigned listen_ms, const char *status)
         !parse_length(line + 6, &length))
         goto close;
 
+    ntn_ota_clear_power_fault();
     if (flash_area_open(FLASH_AREA_IMAGE_SECONDARY(0), &area) ||
         flash_area_erase(area, 0, NTN_OTA_SLOT_SIZE))
     {
-        send_bytes(port, "ERROR FLASH_IO\r\n", 16);
+        if (ntn_ota_last_power_fault())
+            send_bytes(port, "ERROR LOW_POWER\r\n", 17);
+        else
+            send_bytes(port, "ERROR FLASH_IO\r\n", 16);
         goto close;
     }
     if (!send_bytes(port, "RX 1\r\n", 6) || !receive_file(port, area, length))
     {
-        send_bytes(port, "\x18\x18" "ERROR RX\r\n", 12);
+        if (ntn_ota_last_power_fault())
+            send_bytes(port, "\x18\x18" "ERROR LOW_POWER\r\n", 19);
+        else
+            send_bytes(port, "\x18\x18" "ERROR RX\r\n", 12);
         goto close;
     }
     if (!ntn_ota_check_image(area, length))

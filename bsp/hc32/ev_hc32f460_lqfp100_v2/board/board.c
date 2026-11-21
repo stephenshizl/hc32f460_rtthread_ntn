@@ -199,6 +199,13 @@ void PeripheralClock_Config(void)
         CLK_SetUSBClockSrc(CLK_USBCLK_PLLXP);
     }
 #endif
+
+#if defined(NTN_OTA_APP) || defined(NTN_OTA_BL2)
+    /* Seal on-chip Flash write window (end < start => all-deny) and lock EFM. */
+    EFM_FWMC_Cmd(DISABLE);
+    EFM_SetWindowProtectAddr(0x0007E000UL, 0x00000000UL);
+    LL_PERIPH_WP(LL_PERIPH_EFM);
+#endif
 }
 
 /** Peripheral Registers Unlock

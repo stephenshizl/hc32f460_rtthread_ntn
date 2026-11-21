@@ -7,6 +7,7 @@
 #include "ota_layout.h"
 #include "ota_jump.h"
 #include "ota_mailbox.h"
+#include "ota_power.h"
 #include "ota_serial.h"
 #include "ota_watchdog.h"
 #include "app_flash.h"
@@ -194,19 +195,99 @@ int default_CSPRNG(uint8_t *dest, unsigned int size)
     return 0;
 }
 
+/* Independent on-chip verification when external NOR is absent or uninitialized.
+ * Uses only internal primary slot flash_area_read() + static flash geometry (zero NOR I/O).
+ * Requires confirmed primary trailer (excludes unconfirmed trials and active half-swaps),
+ * product/vector compatibility, and full ECDSA-P256 + SHA-256 signature verification. */
+static bool primary_confirmed_without_nor(void)
+{
+    const struct flash_area *primary;
+    struct boot_swap_state swap_state;
+    struct image_header hdr;
+    uint32_t extent;
+
+    if (flash_area_open(FLASH_AREA_IMAGE_PRIMARY(0), &primary) != 0)
+        return false;
+    if (boot_read_swap_state_by_id(FLASH_AREA_IMAGE_PRIMARY(0), &swap_state) != 0 ||
+        swap_state.magic != BOOT_MAGIC_GOOD ||
+        swap_state.image_ok != BOOT_FLAG_SET ||
+        (swap_state.copy_done != BOOT_FLAG_SET && swap_state.copy_done != BOOT_FLAG_UNSET))
+    {
+        flash_area_close(primary);
+        return false;
+    }
+    extent = image_extent(primary, &hdr);
+    if (extent == 0 || !ntn_ota_check_image(primary, extent) ||
+        !ntn_ota_vector_valid(NTN_OTA_APP_VECTOR, NTN_OTA_APP_VECTOR + hdr.ih_img_size))
+    {
+        flash_area_close(primary);
+        return false;
+    }
+    flash_area_close(primary);
+    return true;
+}
+
 static void handoff(void)
 {
     unsigned i;
     __disable_irq();
-    LL_PERIPH_WE(LL_PERIPH_INTC | LL_PERIPH_EFM | LL_PERIPH_FCG);
+    /* 1. Stop SysTick and clear pending OS exceptions before tearing down peripherals. */
+    SysTick->CTRL = 0UL;
+    SysTick->LOAD = 0UL;
+    SysTick->VAL  = 0UL;
+    SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
+
+    LL_PERIPH_WE(LL_PERIPH_GPIO | LL_PERIPH_EFM | LL_PERIPH_FCG |
+                 LL_PERIPH_INTC | LL_PERIPH_PWC_CLK_RMU | LL_PERIPH_SRAM | LL_PERIPH_LVD);
+
+    /* 2. Shut down active BL2 peripherals and restore used pins to GPIO_FUNC_0. */
     (void)USART_DeInit(CM_USART1);
     (void)QSPI_DeInit();
-    /* The HC32F460's unbound selector value is 0x1FF. */
+    PWC_LVD_Cmd(PWC_LVD_CH1, DISABLE);
+    GPIO_SetFunc(GPIO_PORT_A, GPIO_PIN_00 | GPIO_PIN_01, GPIO_FUNC_0);
+    GPIO_SetFunc(GPIO_PORT_B,
+                 GPIO_PIN_01 | GPIO_PIN_02 | GPIO_PIN_10 |
+                 GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14, GPIO_FUNC_0);
+
+    /* 3. Unbind all 128 dynamic INTC routes (0x1FF) and clear shared/pending event sources.
+     * Preserve CM_RMU->RSTF0 so App can inspect the genuine reset reason. */
     for (i = 0; i <= (unsigned)INT127_IRQn; ++i)
         (void)INTC_IrqSignOut((IRQn_Type)i);
+    for (i = 0; i < 16U; ++i)
+        (&CM_INTC->VSSEL128)[i] = 0UL;
+    CM_INTC->EIFCR = 0xFFFFUL;
+    CM_INTC->SWIER = 0UL;
+
+    /* 4. Step system clock down to 16 MHz HRC FIRST, then lower drive mode & wait cycles. */
     CLK_SetSysClockSrc(CLK_SYSCLK_SRC_HRC);
     (void)CLK_PLLCmd(DISABLE);
-    EFM_REG_Lock();
+    (void)PWC_HighPerformanceToHighSpeed();
+    CLK_SetClockDiv(CLK_BUS_CLK_ALL,
+                    (CLK_HCLK_DIV1 | CLK_EXCLK_DIV1 | CLK_PCLK0_DIV1 |
+                     CLK_PCLK1_DIV1 | CLK_PCLK2_DIV1 | CLK_PCLK3_DIV1 | CLK_PCLK4_DIV1));
+    SRAM_SetWaitCycle(SRAM_SRAM_ALL, SRAM_WAIT_CYCLE0, SRAM_WAIT_CYCLE0);
+    GPIO_SetReadWaitCycle(GPIO_RD_WAIT0);
+
+    /* 5. Disable & reset EFM cache, restore 0 wait cycles, and seal all-deny write window. */
+    EFM_CacheCmd(DISABLE);
+    EFM_CacheRamReset(ENABLE);
+    EFM_CacheRamReset(DISABLE);
+    (void)EFM_SetWaitCycle(EFM_WAIT_CYCLE0);
+    EFM_FWMC_Cmd(DISABLE);
+    EFM_SetWindowProtectAddr(0x0007E000UL, 0x00000000UL);
+
+    /* 6. Gate off peripheral clocks opened by BL2 (keep FCG0 reset defaults). */
+    PWC_FCG0_REG_Unlock();
+    CM_PWC->FCG0 = 0xFFFFFAEEUL;
+    CM_PWC->FCG1 = 0xFFFFFFFFUL;
+    CM_PWC->FCG2 = 0xFFFFFFFFUL;
+    CM_PWC->FCG3 = 0xFFFFFFFFUL;
+    PWC_FCG0_REG_Lock();
+
+    LL_PERIPH_WP(LL_PERIPH_GPIO | LL_PERIPH_EFM | LL_PERIPH_FCG |
+                 LL_PERIPH_INTC | LL_PERIPH_PWC_CLK_RMU | LL_PERIPH_SRAM | LL_PERIPH_LVD);
+
+    ntn_ota_feed_watchdog();
     ntn_ota_jump(NTN_OTA_APP_VECTOR);
 }
 
@@ -216,6 +297,7 @@ int main(void)
     FIH_DECLARE(result, FIH_FAILURE);
     int request = ntn_ota_take_boot_request();
     ntn_ota_feed_watchdog();
+    (void)ntn_ota_power_init();
     if (app_flash_init() == RT_EOK)
     {
         FIH_CALL(boot_go, result, &response);
@@ -247,6 +329,11 @@ int main(void)
             ntn_ota_feed_watchdog();
             rt_thread_mdelay(10);
         }
+    }
+    if (primary_confirmed_without_nor())
+    {
+        ntn_ota_report_boot_error("BOOT2 WARN NOR_INIT_FALLBACK_PRIMARY\r\n");
+        handoff();
     }
     ntn_ota_report_boot_error("BOOT2 ERROR NOR_INIT\r\n");
     for (;;)

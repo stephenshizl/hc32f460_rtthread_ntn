@@ -29,6 +29,7 @@ static rt_device_t      s_hw_wdt_dev = RT_NULL;
 static rt_thread_t      s_wdt_thread = RT_NULL;
 static rt_bool_t        s_global_enabled = RT_TRUE;
 static rt_bool_t        s_wdt_init_ok = RT_FALSE;
+static rt_uint32_t      s_healthy_rounds = 0U;
 
 task_wdt_id_t task_wdt_register(const char *task_name, rt_uint32_t timeout_sec)
 {
@@ -87,6 +88,7 @@ void task_wdt_heartbeat(task_wdt_id_t id)
     if (s_tasks[id].is_used)
     {
         s_tasks[id].last_heartbeat_tick = rt_tick_get();
+        s_tasks[id].heartbeat_count++;
         s_tasks[id].is_hung = RT_FALSE;
     }
 }
@@ -103,6 +105,7 @@ void task_wdt_heartbeat_by_name(const char *task_name)
         if (s_tasks[i].is_used && rt_strcmp(s_tasks[i].name, task_name) == 0)
         {
             s_tasks[i].last_heartbeat_tick = rt_tick_get();
+            s_tasks[i].heartbeat_count++;
             s_tasks[i].is_hung = RT_FALSE;
             break;
         }
@@ -150,6 +153,32 @@ rt_bool_t task_wdt_is_all_healthy(void)
     return all_healthy;
 }
 
+rt_bool_t task_wdt_is_confirmed_healthy(void)
+{
+    rt_bool_t rs232_alive = RT_FALSE;
+    rt_uint32_t active_tasks = 0U;
+
+    if (!s_wdt_init_ok || !s_global_enabled || s_healthy_rounds < 3U)
+    {
+        return RT_FALSE;
+    }
+    rt_mutex_take(&s_wdt_lock, RT_WAITING_FOREVER);
+    for (int i = 0; i < TASK_WDT_MAX_TASKS; i++)
+    {
+        if (s_tasks[i].is_used && s_tasks[i].is_enabled)
+        {
+            active_tasks++;
+            if (rt_strcmp(s_tasks[i].name, "rs232") == 0 && s_tasks[i].heartbeat_count > 0U)
+            {
+                rs232_alive = RT_TRUE;
+            }
+        }
+    }
+    rt_bool_t healthy = (active_tasks > 0U) && rs232_alive && task_wdt_is_all_healthy();
+    rt_mutex_release(&s_wdt_lock);
+    return healthy;
+}
+
 /* Supervisor Daemon: runs at 1 Hz */
 static void task_wdt_daemon_entry(void *param)
 {
@@ -168,11 +197,13 @@ static void task_wdt_daemon_entry(void *param)
 
         rt_tick_t now = rt_tick_get();
         rt_bool_t all_healthy = RT_TRUE;
+        rt_uint32_t active_tasks = 0U;
 
         for (int i = 0; i < TASK_WDT_MAX_TASKS; i++)
         {
             if (s_tasks[i].is_used && s_tasks[i].is_enabled)
             {
+                active_tasks++;
                 rt_uint32_t elapsed_s = (now - s_tasks[i].last_heartbeat_tick) / RT_TICK_PER_SECOND;
 
                 if (elapsed_s > s_tasks[i].timeout_sec)
@@ -187,8 +218,12 @@ static void task_wdt_daemon_entry(void *param)
         }
 
         /* Only feed hardware WDT if ALL tasks are healthy */
-        if (all_healthy)
+        if (all_healthy && active_tasks > 0U)
         {
+            if (s_healthy_rounds < 0xFFFFFFFFUL)
+            {
+                s_healthy_rounds++;
+            }
 #ifdef NTN_OTA_APP
             ntn_ota_feed_watchdog();
 #endif
@@ -199,6 +234,7 @@ static void task_wdt_daemon_entry(void *param)
         }
         else
         {
+            s_healthy_rounds = 0U;
             LOG_W("Suppressed hardware WDT keepalive! Awaiting hardware watchdog reset countdown...");
         }
 

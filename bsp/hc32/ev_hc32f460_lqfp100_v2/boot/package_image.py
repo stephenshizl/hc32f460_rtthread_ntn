@@ -79,6 +79,12 @@ def main():
     icg = bl1[cfg:cfg+32]
     if len(icg) != 32 or icg[8:] != b"\xff" * 24:
         raise ValueError("L0 provisioning requires unprotected ICG4/5 and reserved words all ones")
+    icg0, icg1 = struct.unpack_from("<II", icg, 0)
+    # Expected L0 recipe: SWDT auto-start (PERIOD4096/DIV64 ~26.2s, count in sleep) + BOR LVL3 + HRC 16MHz.
+    if icg0 != 0xFFDFEF66 or icg1 != 0xFFFBFEFF:
+        raise ValueError(
+            f"Unexpected BL1 ICG0/ICG1 recipe: got 0x{icg0:08X}/0x{icg1:08X}, "
+            "expected 0xFFDFEF66/0xFFFBFEFF (did you pass --watchdog to prepare_mdk.py?)")
     bl2 = extract(artifact("bl2"), bl2_base, bl2_size)
     bl2 = bl2.ljust(bl2_size, b"\xff")
     digest = hashlib.sha256(bl2).digest()

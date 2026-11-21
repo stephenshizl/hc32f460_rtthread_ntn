@@ -1129,10 +1129,19 @@ rt_bool_t mcu_local_cmd_execute(const rt_uint8_t *line, rt_size_t line_len,
     }
     if (cmd_is_query(cmd, "AT+MCUUPG"))
     {
+#ifdef NTN_OTA_APP
+        rt_snprintf(response, response_size,
+                    "\r\n+MCUUPG:{\"supported\":true,\"channels\":[\"PC_FULL\"],"
+                    "\"planned\":[\"NTN_DIFF\",\"ANDROID_DIFF\",\"ANDROID_FULL\",\"PC_DIFF\"],"
+                    "\"proto\":\"ymodem-1k\",\"ota_layout\":%u,\"boot_abi\":%u,"
+                    "\"recovery_baud\":19200,\"ota_max\":%u}\r\nOK\r\n",
+                    NTN_OTA_LAYOUT_ID, NTN_OTA_BOOT_ABI, NTN_OTA_PACKAGE_MAX);
+#else
         rt_snprintf(response, response_size,
                     "\r\n+MCUUPG:{\"supported\":false,\"planned\":["
                     "\"NTN_DIFF\",\"ANDROID_DIFF\",\"ANDROID_FULL\","
                     "\"PC_DIFF\",\"PC_FULL\"]}\r\nOK\r\n");
+#endif
         return RT_TRUE;
     }
     return RT_FALSE;
