@@ -16,6 +16,7 @@ python -c "import secrets; print(secrets.token_hex(16))"
 
 假设本次得到 Build ID：91fc64cf7b2443eaa7fdbb6026112006。以下全部替换成实际生成的值。
 Build ID 不是 git log 的提交号。它是用于固件运行身份确认的随机 16 字节值，每次发布都重新生成。
+生成命令每执行一次都会得到不同值。一次发布只生成一次，记录该值，并在第 2 步到第 8 步始终使用同一个值。
 
 2. 在编译前生成本次 App 和 BL2 配置。Git Bash：
 python ./boot/prepare_mdk.py --build-id 91fc64cf7b2443eaa7fdbb6026112006 --public-key ./build/ntn-ota/dev-public.pem

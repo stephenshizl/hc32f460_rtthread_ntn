@@ -12,6 +12,7 @@ Build ID 是 32 位十六进制的固件唯一身份。91fc64cf7b2443eaa7fdbb602
 它不属于版本号、密钥、地址或 Git 提交号。不要从 git log 复制。
 每个新发布版本生成一个新的 Build ID。Git Bash：python -c "import secrets; print(secrets.token_hex(16))"
 每个新发布版本生成一个新的 Build ID。PowerShell：[guid]::NewGuid().ToString('N')
+每执行一次生成命令都会得到不同值。一次发布只生成一次，复制并记录该值；本次 BL2、BL1、App、签名和打包命令全部使用同一个 Build ID，不要中途再次生成。
 
 Git Bash：在 BSP 根目录执行下面一条命令。
 ./boot/release_all.sh --version 1.0.6 --build-id 91fc64cf7b2443eaa7fdbb6026112006 --private-key ./build/ntn-ota/dev-private.pem --public-key ./build/ntn-ota/dev-public.pem
