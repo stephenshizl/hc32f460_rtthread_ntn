@@ -13,6 +13,7 @@ python -c "import secrets; print(secrets.token_hex(16))"
 [guid]::NewGuid().ToString('N')
 
 假设本次得到 Build ID：91fc64cf7b2443eaa7fdbb6026112006。以下全部替换成实际生成的值。
+Build ID 不是 git log 的提交号。它是用于固件运行身份确认的随机 16 字节值，每次发布都重新生成。
 
 2. 在编译前生成本次 App 和 BL2 配置。Git Bash：
 python ./boot/prepare_mdk.py --build-id 91fc64cf7b2443eaa7fdbb6026112006 --public-key ./build/ntn-ota/dev-public.pem
@@ -75,3 +76,6 @@ New-Item -ItemType Directory -Force F:\secure-signing | Out-Null; openssl ecpara
 16. 首次使用正式公钥时，回到第 2 步，将 public-key 改成 F:\secure-signing\ntn-prod-public.pem，然后完整执行第 3 至第 8 步。原因是 BL2 必须编入正式公钥，BL1 必须重新写入新 BL2 的 SHA-256 摘要。
 
 17. 第 8 步正式签名时，将 key 改成 F:\secure-signing\ntn-prod-private.pem，将 public-key 改成 F:\secure-signing\ntn-prod-public.pem。
+
+18. 一键脚本默认 Keil 路径：Git Bash 为 /d/soft/codeSoft/Keil_v5/UV4/UV4.exe；PowerShell 为 D:\soft\codeSoft\Keil_v5\UV4\UV4.exe。
+Keil 路径不同：Git Bash 命令末尾增加 --uv4 /d/实际目录/UV4.exe；PowerShell 命令末尾增加 -Uv4 F:\实际目录\UV4.exe。
