@@ -46,3 +46,14 @@ cconfig.h
 
 /ntn-ota-*.uvprojx
 /ntn-ota.uvmpw
+
+# Controlled L0 OTA release workspace. Its own .gitignore admits only the
+# reproducible projects, test keys, release images and station tooling.
+!/ntn-ota-bl1.uvprojx
+!/ntn-ota-bl2.uvprojx
+!/ntn-ota-app.uvprojx
+!/ntn-ota.uvmpw
+!build/
+build/*
+!build/ntn-ota/
+!build/ntn-ota/**

@@ -1,0 +1,25 @@
+# Deliberately versioned L0 release inputs and deliverables.
+*
+!.gitignore
+!dev-private.pem
+!dev-public.pem
+!ota_bl2_digest.h
+!ota_boot_key.c
+!ota_build_id.h
+!bl2.bin
+!flash.uvprojx
+!flash.uvoptx
+!flash_station.py
+!flash_batch.py
+!download-ALL.cmd
+!download-BL1.cmd
+!download-BL2.cmd
+!download-APP.cmd
+!flash-bl1.hex
+!flash-bl2.hex
+!flash-primary.hex
+!app.signed.bin
+!app.confirmed.bin
+!factory.signed.bin
+!ntn-ota-l0.hex
+!ntn-ota-l0.json
