@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<?xml version='1.0' encoding='utf-8'?>
 <Project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="project_projx.xsd">
 
   <SchemaVersion>2.1</SchemaVersion>
@@ -19,28 +19,28 @@
           <PackID>HDSC.HC32F460.1.0.11</PackID>
           <PackURL>https://raw.githubusercontent.com/hdscmcu/pack/master/</PackURL>
           <Cpu>IROM1(0x00000000,0x4000) IROM2(0x03000C00,0x3FC) IRAM1(0x1FFF8000,0x2F000)  IRAM2(0x200F0000,0x1000) CPUTYPE("Cortex-M4") FPU2 CLOCK(8000000) ESEL ELITTLE</Cpu>
-          <FlashUtilSpec></FlashUtilSpec>
-          <StartupFile></StartupFile>
+          <FlashUtilSpec />
+          <StartupFile />
           <FlashDriverDll>CMSIS_AGDI(-S0 -C0 -P0 -FD1FFF8000 -FC1000 -FN2 -FF0HC32F460_512K -FS00 -FL080000 -FP0($$Device:HC32F460PETB$FlashARM\HC32F460_512K.FLM) -FF1HC32F460_otp -FS103000C00 -FL13FC -FP1($$Device:HC32F460PETB$FlashARM\HC32F460_otp.FLM))</FlashDriverDll>
           <DeviceId>0</DeviceId>
           <RegisterFile>$$Device:HC32F460PETB$Device\Include\HC32F460PETB.h</RegisterFile>
-          <MemoryEnv></MemoryEnv>
-          <Cmp></Cmp>
-          <Asm></Asm>
-          <Linker></Linker>
-          <OHString></OHString>
-          <InfinionOptionDll></InfinionOptionDll>
-          <SLE66CMisc></SLE66CMisc>
-          <SLE66AMisc></SLE66AMisc>
-          <SLE66LinkerMisc></SLE66LinkerMisc>
+          <MemoryEnv />
+          <Cmp />
+          <Asm />
+          <Linker />
+          <OHString />
+          <InfinionOptionDll />
+          <SLE66CMisc />
+          <SLE66AMisc />
+          <SLE66LinkerMisc />
           <SFDFile>./packages/hc32-f4-cmsis-latest/Device/HDSC/hc32f460/Source/ARM/sfr/HC32F460.SFR</SFDFile>
           <bCustSvd>1</bCustSvd>
           <UseEnv>0</UseEnv>
-          <BinPath></BinPath>
-          <IncludePath></IncludePath>
-          <LibPath></LibPath>
-          <RegisterFilePath></RegisterFilePath>
-          <DBRegisterFilePath></DBRegisterFilePath>
+          <BinPath />
+          <IncludePath />
+          <LibPath />
+          <RegisterFilePath />
+          <DBRegisterFilePath />
           <TargetStatus>
             <Error>0</Error>
             <ExitCodeStop>0</ExitCodeStop>
@@ -62,8 +62,8 @@
           <BeforeCompile>
             <RunUserProg1>0</RunUserProg1>
             <RunUserProg2>0</RunUserProg2>
-            <UserProg1Name></UserProg1Name>
-            <UserProg2Name></UserProg2Name>
+            <UserProg1Name />
+            <UserProg2Name />
             <UserProg1Dos16Mode>0</UserProg1Dos16Mode>
             <UserProg2Dos16Mode>0</UserProg2Dos16Mode>
             <nStopU1X>0</nStopU1X>
@@ -72,8 +72,8 @@
           <BeforeMake>
             <RunUserProg1>0</RunUserProg1>
             <RunUserProg2>0</RunUserProg2>
-            <UserProg1Name></UserProg1Name>
-            <UserProg2Name></UserProg2Name>
+            <UserProg1Name />
+            <UserProg2Name />
             <UserProg1Dos16Mode>0</UserProg1Dos16Mode>
             <UserProg2Dos16Mode>0</UserProg2Dos16Mode>
             <nStopB1X>0</nStopB1X>
@@ -83,14 +83,14 @@
             <RunUserProg1>0</RunUserProg1>
             <RunUserProg2>0</RunUserProg2>
             <UserProg1Name>fromelf --bin !L --output rtthread.bin</UserProg1Name>
-            <UserProg2Name></UserProg2Name>
+            <UserProg2Name />
             <UserProg1Dos16Mode>0</UserProg1Dos16Mode>
             <UserProg2Dos16Mode>0</UserProg2Dos16Mode>
             <nStopA1X>0</nStopA1X>
             <nStopA2X>0</nStopA2X>
           </AfterMake>
           <SelectedForBatchBuild>0</SelectedForBatchBuild>
-          <SVCSIdString></SVCSIdString>
+          <SVCSIdString />
         </TargetCommonOption>
         <CommonProperty>
           <UseCPPCompiler>0</UseCPPCompiler>
@@ -104,8 +104,8 @@
           <AssembleAssemblyFile>0</AssembleAssemblyFile>
           <PublicsOnly>0</PublicsOnly>
           <StopOnExitCode>3</StopOnExitCode>
-          <CustomArgument></CustomArgument>
-          <IncludeLibraryModules></IncludeLibraryModules>
+          <CustomArgument />
+          <IncludeLibraryModules />
           <ComprImg>1</ComprImg>
         </CommonProperty>
         <DllOption>
@@ -139,10 +139,10 @@
           <bUseTDR>1</bUseTDR>
           <Flash2>BIN\UL2CM3.DLL</Flash2>
           <Flash3>"" ()</Flash3>
-          <Flash4></Flash4>
-          <pFcarmOut></pFcarmOut>
-          <pFcarmGrp></pFcarmGrp>
-          <pFcArmRoot></pFcArmRoot>
+          <Flash4 />
+          <pFcarmOut />
+          <pFcarmGrp />
+          <pFcArmRoot />
           <FcArmLst>0</FcArmLst>
         </Utilities>
         <TargetArmAds>
@@ -175,7 +175,7 @@
             <RvctClst>0</RvctClst>
             <GenPPlst>0</GenPPlst>
             <AdsCpuType>"Cortex-M4"</AdsCpuType>
-            <RvctDeviceName></RvctDeviceName>
+            <RvctDeviceName />
             <mOS>0</mOS>
             <uocRom>0</uocRom>
             <uocRam>0</uocRam>
@@ -310,7 +310,7 @@
                 <Size>0x1000</Size>
               </OCR_RVCT10>
             </OnChipMemories>
-            <RvctStartVector></RvctStartVector>
+            <RvctStartVector />
           </ArmAdsMisc>
           <Cads>
             <interw>1</interw>
@@ -339,7 +339,7 @@
             <VariousControls>
               <MiscControls>--preinclude boot/ota_icg.h</MiscControls>
               <Define>RT_USING_ARMLIBC, __DEBUG, USE_DDL_DRIVER, __CLK_TCK=RT_TICK_PER_SECOND, RT_USING_LIBC, __RTTHREAD__, __STDC_LIMIT_MACROS, HC32F460, NTN_OTA_BL1, VECT_TAB_OFFSET=0x00000000</Define>
-              <Undefine></Undefine>
+              <Undefine />
               <IncludePath>.;applications;applications\segger_rtt;board;board\ports;board\config;board\config\usb_config;packages\hc32-f4-cmsis-latest\Include;packages\hc32-f4-cmsis-latest\Device\HDSC\hc32f460\Include;packages\hc32-f4-series-latest\hc32f460\inc;..\..\..\include;..\..\..\libcpu\arm\common;..\..\..\libcpu\arm\cortex-m4;..\..\..\components\drivers\include;..\..\..\components\drivers\smp_call;..\..\..\components\drivers\spi;..\..\..\components\drivers\spi\sfud\inc;..\..\..\components\fal\inc;..\..\..\components\finsh;..\..\..\components\libc\compilers\common\include;..\..\..\components\libc\compilers\common\extension;..\..\..\components\libc\compilers\common\extension\fcntl\octal;..\..\..\components\libc\posix\io\epoll;..\..\..\components\libc\posix\io\eventfd;..\..\..\components\libc\posix\io\poll;..\..\..\components\libc\posix\ipc;..\..\..\components\net\utest;..\libraries\hc32_drivers;..\libraries\hc32_drivers\drv_flash;..\platform\fal;..\platform\sfud;..\tests;boot;build/ntn-ota</IncludePath>
             </VariousControls>
           </Cads>
@@ -355,10 +355,10 @@
             <useXO>0</useXO>
             <ClangAsOpt>4</ClangAsOpt>
             <VariousControls>
-              <MiscControls></MiscControls>
-              <Define></Define>
-              <Undefine></Undefine>
-              <IncludePath></IncludePath>
+              <MiscControls />
+              <Define />
+              <Undefine />
+              <IncludePath />
             </VariousControls>
           </Aads>
           <LDads>
@@ -370,13 +370,13 @@
             <useFile>0</useFile>
             <TextAddressRange>0x00000000</TextAddressRange>
             <DataAddressRange>0x1FFF8000</DataAddressRange>
-            <pXoBase></pXoBase>
+            <pXoBase />
             <ScatterFile>.\boot\ota_bl1.sct</ScatterFile>
-            <IncludeLibs></IncludeLibs>
-            <IncludeLibsPath></IncludeLibsPath>
-            <Misc></Misc>
-            <LinkerInputFile></LinkerInputFile>
-            <DisabledWarnings></DisabledWarnings>
+            <IncludeLibs />
+            <IncludeLibsPath />
+            <Misc />
+            <LinkerInputFile />
+            <DisabledWarnings />
           </LDads>
         </TargetArmAds>
       </TargetOption>
@@ -419,7 +419,7 @@
               <FileType>1</FileType>
               <FilePath>packages\hc32-f4-series-latest\hc32f460\src\hc32_ll_swdt.c</FilePath>
             </File>
-          </Files>
+            </Files>
         </Group>
         <Group>
           <GroupName>Libraries</GroupName>
@@ -436,29 +436,14 @@
             </File>
           </Files>
         </Group>
-        <Group>
-          <GroupName>BL1</GroupName>
-          <Files>
-            <File>
-              <FileName>ota_bl1.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>boot\ota_bl1.c</FilePath>
-            </File>
-            <File>
-              <FileName>hc32_ll_hash.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>packages\hc32-f4-series-latest\hc32f460\src\hc32_ll_hash.c</FilePath>
-            </File>
-          </Files>
-        </Group>
-      </Groups>
+        <Group><GroupName>BL1</GroupName><Files><File><FileName>ota_bl1.c</FileName><FileType>1</FileType><FilePath>boot\ota_bl1.c</FilePath></File><File><FileName>hc32_ll_hash.c</FileName><FileType>1</FileType><FilePath>packages\hc32-f4-series-latest\hc32f460\src\hc32_ll_hash.c</FilePath></File></Files></Group></Groups>
     </Target>
   </Targets>
 
   <RTE>
-    <apis/>
-    <components/>
-    <files/>
+    <apis />
+    <components />
+    <files />
   </RTE>
 
 </Project>

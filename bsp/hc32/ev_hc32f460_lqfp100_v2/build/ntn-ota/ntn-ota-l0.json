@@ -1,6 +1,6 @@
 {
   "layout": 1,
-  "app_version": "1.0.6",
+  "app_version": "1.0.8",
   "public_key_sha256": "6207a795aa1da7c9106e79d785d344919badcaa50ef5e93a9afe7077ee54de6d",
   "icg": "66efdffffffefbffffffffffffffffffffffffffffffffffffffffffffffffff",
   "onchip": [
@@ -8,25 +8,25 @@
       "name": "bl1",
       "offset": 0,
       "size": 8900,
-      "sha256": "41ddb94c62fc61bf5ed00d4f759ba0ee30511424edb2c5b5b704f8f4b884ad01"
+      "sha256": "a1882068ec44c3f24c7c0e34feede78c6c97b245c5004105544877cb681fb62e"
     },
     {
       "name": "bl2",
       "offset": 16384,
       "size": 114688,
-      "sha256": "c79585edddb9c157af952be96d1332967faf63dce38f6e4829d9aacbc8eaa74e"
+      "sha256": "be2f6e72763e50490692d0c385258ef88140f8ff99a027f2f38fb86d5127eb14"
     },
     {
       "name": "primary",
       "offset": 131072,
       "size": 385024,
-      "sha256": "8d5610e8575b51aac0477f3bd06a49393a0268add0d32f182784f187bda0be59"
+      "sha256": "fa2436d78d90f6f536800e3ce880ea9aa0b36ad9eb0593272525b34791105d2a"
     }
   ],
   "nor": {
     "file": "factory.signed.bin",
     "offset": 524288,
-    "size": 226751,
-    "sha256": "e415ff2304549b5363ad9abe868b619c1dba1c71eca4745bf4e1fffd018888a3"
+    "size": 226752,
+    "sha256": "db96fe4e39d8929407d1598480fbf875f01617a2aa37be695af6b59d98cf8aba"
   }
 }

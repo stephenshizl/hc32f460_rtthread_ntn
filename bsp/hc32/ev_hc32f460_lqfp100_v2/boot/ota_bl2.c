@@ -286,11 +286,22 @@ int main(void)
             ntn_ota_vector_valid(NTN_OTA_APP_VECTOR,
                                  NTN_OTA_APP_VECTOR + response.br_hdr->ih_img_size))
         {
+            /*
+             * An App-requested OTA session must not depend on the swap trailer
+             * state.  The mailbox is written immediately before a system reset;
+             * it is the authoritative request to keep the RS232 recovery port
+             * open.  In particular, a valid trial image can legitimately lack
+             * image_ok while it is waiting for its confirmation task.
+             */
+            if (request && ntn_ota_serial(10000U,
+                                          "BOOT2 INFO BL1_OK NOR_OK OTA_REQUEST\r\n"))
+                NVIC_SystemReset();
+
             /* An unconfirmed trial still owns the secondary slot for revert. */
             struct boot_swap_state state;
             if (!boot_read_swap_state_by_id(FLASH_AREA_IMAGE_PRIMARY(0), &state) &&
                 state.image_ok == BOOT_FLAG_SET &&
-                ntn_ota_serial(request ? 10000U : 1000U,
+                ntn_ota_serial(1000U,
                                "BOOT2 INFO BL1_OK NOR_OK APP_VERIFIED\r\n"))
                 NVIC_SystemReset();
             handoff();

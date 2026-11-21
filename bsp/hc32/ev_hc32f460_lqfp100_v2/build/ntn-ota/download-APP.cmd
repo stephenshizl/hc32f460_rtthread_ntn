@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-python flash_station.py "flash-primary.hex" --sha256 fb8c9a2d1e67c3716aff1e55a5b5ea816c4a12e76eaaec3d26be510fc041c80a > "download-APP.log" 2>&1
+python flash_station.py "flash-primary.hex" --sha256 0cef2c4ade7785bbbbdd02893ae689e9dfdf044676b7639e931ca982d6d8d858 > "download-APP.log" 2>&1
 set "result=%errorlevel%"
 type "download-APP.log"
 exit /b %result%
