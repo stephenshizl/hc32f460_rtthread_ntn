@@ -114,6 +114,13 @@ static rt_bool_t handle_capability(const char *cmd, char *out, rt_size_t out_siz
     return RT_TRUE;
 }
 
+static const char *persisted_text(rt_bool_t persisted)
+{
+    return persisted ? "true" : "false";
+}
+
+static rt_bool_t s_baud_change_pending;
+
 static rt_bool_t handle_mode(const char *cmd, char *out, rt_size_t out_size)
 {
     const char *value = cmd_set_value(cmd, "AT+MCUMODE");
@@ -125,8 +132,9 @@ static rt_bool_t handle_mode(const char *cmd, char *out, rt_size_t out_size)
     {
         param_get_snapshot(&cfg);
         rt_snprintf(out, out_size,
-                    "\r\n+MCUMODE:{\"saved\":%u,\"effective\":%u,\"revision\":%u}\r\nOK\r\n",
-                    cfg.work_mode, cfg.work_mode, cfg.revision);
+                    "\r\n+MCUMODE:{\"saved\":%u,\"effective\":%u,\"revision\":%u,\"persisted\":%s}\r\nOK\r\n",
+                    cfg.work_mode, cfg.work_mode, cfg.revision,
+                    persisted_text(param_has_persisted_config()));
         return RT_TRUE;
     }
     if (value == RT_NULL)
@@ -142,16 +150,16 @@ static rt_bool_t handle_mode(const char *cmd, char *out, rt_size_t out_size)
         cmd_error(out, out_size, 1);
         return RT_TRUE;
     }
-    result = param_set_work_mode((rt_uint8_t)mode, RT_TRUE);
-    if (result != RT_EOK)
+    result = param_set_work_mode((rt_uint8_t)mode, PARAM_SAVE_BEST_EFFORT);
+    if (result < 0)
     {
         cmd_error(out, out_size, 3);
         return RT_TRUE;
     }
     param_get_snapshot(&cfg);
     rt_snprintf(out, out_size,
-                "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"rev\":%u,\"mode\":%u}\r\nOK\r\n",
-                cfg.revision, cfg.work_mode);
+                "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"rev\":%u,\"mode\":%u,\"persisted\":%s}\r\nOK\r\n",
+                cfg.revision, cfg.work_mode, persisted_text(result == RT_EOK));
     return RT_TRUE;
 }
 
@@ -209,8 +217,8 @@ static rt_bool_t handle_host(const char *cmd, char *out, rt_size_t out_size)
     {
         return RT_FALSE;
     }
-    result = param_set_host(value, RT_TRUE);
-    if (result != RT_EOK)
+    result = param_set_host(value, PARAM_SAVE_BEST_EFFORT);
+    if (result < 0)
     {
         cmd_error(out, out_size, (result == -RT_EINVAL) ? 1 : 3);
     }
@@ -219,7 +227,7 @@ static rt_bool_t handle_host(const char *cmd, char *out, rt_size_t out_size)
         param_get_snapshot(&cfg);
         rt_snprintf(out, out_size,
                     "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"rev\":%u,"
-                    "\"host\":\"%s\"}\r\nOK\r\n", cfg.revision, cfg.host);
+                    "\"host\":\"%s\",\"persisted\":%s}\r\nOK\r\n", cfg.revision, cfg.host, persisted_text(result == RT_EOK));
     }
     return RT_TRUE;
 }
@@ -265,7 +273,8 @@ static rt_bool_t handle_port(const char *cmd, char *out, rt_size_t out_size)
         cmd_error(out, out_size, 1);
         return RT_TRUE;
     }
-    if (param_set_ports((rt_uint16_t)remote_port, (rt_uint16_t)local_port, RT_TRUE) != RT_EOK)
+    rt_err_t result = param_set_ports((rt_uint16_t)remote_port, (rt_uint16_t)local_port, PARAM_SAVE_BEST_EFFORT);
+    if (result < 0)
     {
         cmd_error(out, out_size, 3);
     }
@@ -274,10 +283,36 @@ static rt_bool_t handle_port(const char *cmd, char *out, rt_size_t out_size)
         param_get_snapshot(&cfg);
         rt_snprintf(out, out_size,
                     "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"rev\":%u,"
-                    "\"remote\":%u,\"local\":%u}\r\nOK\r\n",
-                    cfg.revision, cfg.remote_port, cfg.local_port);
+                    "\"remote\":%u,\"local\":%u,\"persisted\":%s}\r\nOK\r\n",
+                    cfg.revision, cfg.remote_port, cfg.local_port, persisted_text(result == RT_EOK));
     }
     return RT_TRUE;
+}
+
+void mcu_local_cmd_complete_baud(rt_uint32_t baud, rt_bool_t port_ready,
+                                 char *out, rt_size_t out_size)
+{
+    rt_err_t result;
+    rt_base_t level;
+
+    if (!port_ready)
+    {
+        cmd_error(out, out_size, 6U);
+    }
+    else if (baud != pc_rs232_get_baudrate() && pc_rs232_set_baudrate(baud) != RT_EOK)
+    {
+        cmd_error(out, out_size, 3U);
+    }
+    else
+    {
+        result = param_set_rs232_baud(baud, PARAM_SAVE_BEST_EFFORT);
+        rt_snprintf(out, out_size,
+                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"baud\":%u,\"persisted\":%s}\r\nOK\r\n",
+                    baud, persisted_text(result == RT_EOK));
+    }
+    level = rt_hw_interrupt_disable();
+    s_baud_change_pending = RT_FALSE;
+    rt_hw_interrupt_enable(level);
 }
 
 static rt_bool_t handle_baud(const char *cmd, char *out, rt_size_t out_size,
@@ -285,7 +320,7 @@ static rt_bool_t handle_baud(const char *cmd, char *out, rt_size_t out_size,
 {
     const char *value = cmd_set_value(cmd, "AT+MCURS232");
     rt_uint32_t baud;
-    rt_uint32_t old_baud;
+    rt_base_t level;
     char copy[40];
     char *suffix;
 
@@ -293,8 +328,9 @@ static rt_bool_t handle_baud(const char *cmd, char *out, rt_size_t out_size,
     {
         rt_snprintf(out, out_size,
                     "\r\n+MCURS232:{\"saved_baud\":%u,\"effective_baud\":%u,"
-                    "\"format\":\"8N1\"}\r\nOK\r\n",
-                    param_get_rs232_baud(), pc_rs232_get_baudrate());
+                    "\"format\":\"8N1\",\"persisted\":%s}\r\nOK\r\n",
+                    param_get_rs232_baud(), pc_rs232_get_baudrate(),
+                    persisted_text(param_has_persisted_config()));
         return RT_TRUE;
     }
     if (value == RT_NULL)
@@ -322,27 +358,28 @@ static rt_bool_t handle_baud(const char *cmd, char *out, rt_size_t out_size,
             return RT_TRUE;
         }
     }
-    if (!parse_u32(copy, &baud))
+    if (!parse_u32(copy, &baud) || !param_baud_is_valid(baud))
     {
         cmd_error(out, out_size, 1);
         return RT_TRUE;
     }
-    old_baud = pc_rs232_get_baudrate();
-    if (param_set_rs232_baud(baud, RT_TRUE) != RT_EOK)
+    level = rt_hw_interrupt_disable();
+    if (s_baud_change_pending)
     {
-        cmd_error(out, out_size, 3);
+        rt_hw_interrupt_enable(level);
+        cmd_error(out, out_size, 6);
         return RT_TRUE;
     }
-    if (baud == old_baud)
+    s_baud_change_pending = RT_TRUE;
+    rt_hw_interrupt_enable(level);
+    if (baud == pc_rs232_get_baudrate())
     {
-        rt_snprintf(out, out_size,
-                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"baud\":%u}\r\nOK\r\n", baud);
+        mcu_local_cmd_complete_baud(baud, RT_TRUE, out, out_size);
     }
     else
     {
         action->type = MCU_CMD_ACTION_APPLY_RS232_BAUD;
         action->value = baud;
-        action->previous_value = old_baud;
         rt_snprintf(out, out_size,
                     "\r\n+MCUPENDING:{\"action\":\"RS232_BAUD\",\"baud\":%u}\r\n", baud);
     }
@@ -419,9 +456,9 @@ static rt_bool_t handle_text_setting(const char *cmd, char *out, rt_size_t out_s
     value = cmd_set_value(cmd, "AT+MCUAPN");
     if (value != RT_NULL)
     {
-        result = param_set_apn(value, RT_TRUE);
-        if (result != RT_EOK) cmd_error(out, out_size, (result == -RT_EINVAL) ? 1 : 3);
-        else rt_snprintf(out, out_size, "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"apn\":true}\r\nOK\r\n");
+        result = param_set_apn(value, PARAM_SAVE_BEST_EFFORT);
+        if (result < 0) cmd_error(out, out_size, (result == -RT_EINVAL) ? 1 : 3);
+        else rt_snprintf(out, out_size, "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"apn\":true,\"persisted\":%s}\r\nOK\r\n", persisted_text(result == RT_EOK));
         return RT_TRUE;
     }
 
@@ -493,14 +530,16 @@ static rt_bool_t handle_dns(const char *cmd, char *out, rt_size_t out_size)
     {
         secondary = (char *)"";
     }
-    if (param_set_dns((rt_uint8_t)mode, primary, secondary, RT_TRUE) != RT_EOK)
+    rt_err_t result = param_set_dns((rt_uint8_t)mode, primary, secondary, PARAM_SAVE_BEST_EFFORT);
+    if (result < 0)
     {
         cmd_error(out, out_size, 1);
     }
     else
     {
         rt_snprintf(out, out_size,
-                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"dns\":true}\r\nOK\r\n");
+                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"dns\":true,\"persisted\":%s}\r\nOK\r\n",
+                    persisted_text(result == RT_EOK));
     }
     return RT_TRUE;
 }
@@ -536,15 +575,17 @@ static rt_bool_t handle_rx_mode(const char *cmd, char *out, rt_size_t out_size)
         /* Exact push URC syntax has not yet been verified on the target MS150. */
         cmd_error(out, out_size, 2);
     }
-    else if (param_set_rx_mode((rt_uint8_t)mode, RT_TRUE) != RT_EOK)
-    {
-        cmd_error(out, out_size, 3);
-    }
     else
     {
+        rt_err_t result = param_set_rx_mode((rt_uint8_t)mode, PARAM_SAVE_BEST_EFFORT);
+        if (result < 0)
+        {
+            cmd_error(out, out_size, 3);
+            return RT_TRUE;
+        }
         rt_snprintf(out, out_size,
-                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"rx_mode\":%u}\r\nOK\r\n",
-                    mode);
+                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"rx_mode\":%u,\"persisted\":%s}\r\nOK\r\n",
+                    mode, persisted_text(result == RT_EOK));
     }
     return RT_TRUE;
 }
@@ -1114,7 +1155,6 @@ rt_bool_t mcu_local_cmd_execute(const rt_uint8_t *line, rt_size_t line_len,
     }
     action->type = MCU_CMD_ACTION_NONE;
     action->value = 0U;
-    action->previous_value = 0U;
     response[0] = '\0';
     if (line_len == 0U || line_len >= sizeof(cmd))
     {

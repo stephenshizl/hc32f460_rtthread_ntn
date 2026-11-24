@@ -89,29 +89,40 @@ const param_config_t *param_get_active(void);
 void param_get_snapshot(param_config_t *out_config);
 rt_bool_t param_has_persisted_config(void);
 
+typedef enum
+{
+    PARAM_SAVE_RAM_ONLY = 0,
+    PARAM_SAVE_REQUIRED = 1,
+    PARAM_SAVE_BEST_EFFORT
+} param_save_policy_t;
+
+/* Successful application in RAM without a verified NV write. */
+#define PARAM_APPLIED_VOLATILE 1
+
 rt_err_t param_save(void);
 rt_err_t param_reset_factory(void);
 
 rt_uint8_t param_get_work_mode(void);
-rt_err_t param_set_work_mode(rt_uint8_t mode, rt_bool_t save_now);
+rt_err_t param_set_work_mode(rt_uint8_t mode, param_save_policy_t policy);
 rt_uint8_t param_get_transfer_mode(void);
 rt_err_t param_set_transfer_mode(rt_uint8_t mode, rt_bool_t save_now);
 
 rt_uint32_t param_get_report_interval(void);
 rt_err_t param_set_report_interval(rt_uint32_t seconds, rt_bool_t save_now);
 rt_uint32_t param_get_rs232_baud(void);
-rt_err_t param_set_rs232_baud(rt_uint32_t baud, rt_bool_t save_now);
+rt_bool_t param_baud_is_valid(rt_uint32_t baud);
+rt_err_t param_set_rs232_baud(rt_uint32_t baud, param_save_policy_t policy);
 
 const char *param_get_ntn_server(rt_uint16_t *out_port);
 rt_err_t param_set_ntn_server(const char *host, rt_uint16_t port, rt_bool_t save_now);
-rt_err_t param_set_host(const char *host, rt_bool_t save_now);
-rt_err_t param_set_ports(rt_uint16_t remote_port, rt_uint16_t local_port, rt_bool_t save_now);
+rt_err_t param_set_host(const char *host, param_save_policy_t policy);
+rt_err_t param_set_ports(rt_uint16_t remote_port, rt_uint16_t local_port, param_save_policy_t policy);
 rt_bool_t param_endpoint_is_configured(void);
 rt_uint32_t param_get_endpoint_identity(void);
-rt_err_t param_set_apn(const char *apn, rt_bool_t save_now);
+rt_err_t param_set_apn(const char *apn, param_save_policy_t policy);
 rt_err_t param_set_dns(rt_uint8_t mode, const char *primary,
-                       const char *secondary, rt_bool_t save_now);
-rt_err_t param_set_rx_mode(rt_uint8_t mode, rt_bool_t save_now);
+                       const char *secondary, param_save_policy_t policy);
+rt_err_t param_set_rx_mode(rt_uint8_t mode, param_save_policy_t policy);
 rt_err_t param_set_pc_cfg_enabled(rt_bool_t enabled, rt_bool_t save_now);
 rt_err_t param_set_ntn_location_enabled(rt_bool_t enabled, rt_bool_t save_now);
 rt_err_t param_set_asset_report(rt_bool_t enabled, rt_uint32_t period_s,

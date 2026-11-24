@@ -191,31 +191,19 @@ static void ctrl2_apply_baud(rt_uint16_t request_id,
                              const mcu_cmd_action_t *action)
 {
     rt_tick_t deadline;
-    rt_err_t result = -RT_EBUSY;
+    rt_bool_t ready = RT_FALSE;
     ctrl2_send_text(CTRL2_TYPE_LOCAL_PENDING, request_id, s_local_response);
     deadline = rt_tick_get() + rt_tick_from_millisecond(2000U);
     while ((rt_int32_t)(rt_tick_get() - deadline) < 0)
     {
         if (pc_rs232_is_idle(100U))
         {
-            result = pc_rs232_set_baudrate(action->value);
+            ready = RT_TRUE;
             break;
         }
         rt_thread_mdelay(20U);
     }
-    if (result == RT_EOK)
-    {
-        rt_snprintf(s_local_response, sizeof(s_local_response),
-                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"baud\":%u}\r\nOK\r\n",
-                    action->value);
-    }
-    else
-    {
-        (void)param_set_rs232_baud(action->previous_value, RT_TRUE);
-        rt_snprintf(s_local_response, sizeof(s_local_response),
-                    "\r\n+MCUERROR:%u\r\nERROR\r\n",
-                    (result == -RT_EBUSY) ? 6U : 3U);
-    }
+    mcu_local_cmd_complete_baud(action->value, ready, s_local_response, sizeof(s_local_response));
     ctrl2_send_text(CTRL2_TYPE_LOCAL_FINAL, request_id, s_local_response);
 }
 

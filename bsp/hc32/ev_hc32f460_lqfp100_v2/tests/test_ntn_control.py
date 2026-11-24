@@ -117,8 +117,8 @@ static int mcu_local_cmd_execute(const rt_uint8_t *s, rt_size_t n, char *r,
     action->type = MCU_CMD_ACTION_NONE;
     return handle_reboot(command, r, size, action);
 }
-static int pc_rs232_set_baudrate(unsigned baud) { (void)baud; return RT_EOK; }
-static int param_set_rs232_baud(unsigned baud, int save) { (void)baud; (void)save; return RT_EOK; }
+static void mcu_local_cmd_complete_baud(rt_uint32_t baud, rt_bool_t ready, char *out, rt_size_t size)
+{ (void)baud; (void)ready; (void)out; (void)size; }
 static void rt_hw_cpu_reset(void) {
     assert(!isr && now == 500);
     if (!rtt_reset) {
@@ -242,7 +242,7 @@ int main(void) {
     assert(sys_reboot(2, NULL) == -RT_EINVAL && cpu_resets == 0 && now == 0);
     assert(sys_reboot(1, NULL) == RT_EOK && cpu_resets == 1 && now == 500);
     reset_state(); {
-        mcu_cmd_action_t action = {MCU_CMD_ACTION_NONE, 0, 0};
+        mcu_cmd_action_t action = { .type = MCU_CMD_ACTION_NONE };
         assert(!handle_reboot("AT+MCUREBOOT?", response, sizeof(response), &action));
         assert(!handle_reboot("AT+MCUREBOOT=1", response, sizeof(response), &action));
         mcu_local_cmd_apply_reboot(&action);

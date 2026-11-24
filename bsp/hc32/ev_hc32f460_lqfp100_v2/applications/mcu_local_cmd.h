@@ -19,7 +19,6 @@ typedef struct
 {
     mcu_cmd_action_type_t type;
     rt_uint32_t value;
-    rt_uint32_t previous_value;
 } mcu_cmd_action_t;
 
 /*
@@ -29,6 +28,10 @@ typedef struct
 rt_bool_t mcu_local_cmd_execute(const rt_uint8_t *line, rt_size_t line_len,
                                 char *response, rt_size_t response_size,
                                 mcu_cmd_action_t *action);
+
+/* Finish an accepted baud change after flushing the old-rate response. */
+void mcu_local_cmd_complete_baud(rt_uint32_t baud, rt_bool_t port_ready,
+                                 char *out, rt_size_t out_size);
 
 /* Call only after sending the command response, in thread context. */
 void mcu_local_cmd_apply_reboot(const mcu_cmd_action_t *action);

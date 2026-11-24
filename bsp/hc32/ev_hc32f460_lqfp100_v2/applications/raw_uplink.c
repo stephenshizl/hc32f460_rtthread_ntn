@@ -356,7 +356,7 @@ static void raw_uplink_thread_entry(void *parameter)
         }
         current_endpoint = param_get_endpoint_identity();
         store_forward_get_stats(&flash);
-        if (flash.total_pending > 0U)
+        if (!flash.history_unavailable && flash.total_pending > 0U)
         {
             s_flash_handoff = RT_TRUE;
             (void)raw_send_flash_head(current_endpoint);
@@ -366,7 +366,15 @@ static void raw_uplink_thread_entry(void *parameter)
         have_ram = raw_copy_ram_head(&block);
         if (!have_ram)
         {
-            if (flash.total_pending == 0U) s_flash_handoff = RT_FALSE;
+            if (flash.history_unavailable || flash.total_pending == 0U) s_flash_handoff = RT_FALSE;
+            continue;
+        }
+
+        if (flash.history_unavailable)
+        {
+            /* Keep unreadable history intact and send new, correctly routed data from RAM. */
+            if (block.endpoint_id == 0U || block.endpoint_id == current_endpoint)
+                raw_send_ram_head(&block);
             continue;
         }
 

@@ -68,7 +68,7 @@ static void param_set_defaults(param_config_t *cfg)
     cfg->crc32 = param_calc_crc(cfg);
 }
 
-static rt_bool_t param_baud_is_valid(rt_uint32_t baud)
+rt_bool_t param_baud_is_valid(rt_uint32_t baud)
 {
     return (baud == 9600U || baud == 19200U || baud == 38400U ||
             baud == 57600U || baud == 115200U) ? RT_TRUE : RT_FALSE;
@@ -202,26 +202,39 @@ static rt_bool_t param_config_is_valid(const param_config_t *cfg)
     return RT_TRUE;
 }
 
-static rt_err_t param_finish_update(const param_config_t *before, rt_bool_t save_now)
-{
-    rt_err_t result;
-    if (!save_now)
-    {
-        return RT_EOK;
-    }
-    result = param_save();
-    if (result != RT_EOK)
-    {
-        rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
-        s_config = *before;
-        rt_mutex_release(&s_param_lock);
-    }
-    return result;
-}
+static rt_err_t param_save_locked(void);
 
-const param_config_t *param_get_active(void)
+/* The caller holds s_param_lock across mutation, writeback, and rollback. */
+static rt_err_t param_finish_update(const param_config_t *before, param_save_policy_t policy)
 {
-    return &s_config;
+    rt_err_t result = RT_EOK;
+
+    if (policy != PARAM_SAVE_RAM_ONLY)
+    {
+        result = param_save_locked();
+        if (result != RT_EOK)
+        {
+            if (policy == PARAM_SAVE_BEST_EFFORT)
+            {
+                s_persisted_config = RT_FALSE;
+                result = PARAM_APPLIED_VOLATILE;
+            }
+            else
+            {
+                s_config = *before;
+            }
+        }
+    }
+    else
+    {
+        s_persisted_config = RT_FALSE;
+    }
+    if (result == PARAM_APPLIED_VOLATILE || policy == PARAM_SAVE_RAM_ONLY)
+    {
+        s_config.crc32 = param_calc_crc(&s_config);
+    }
+    rt_mutex_release(&s_param_lock);
+    return result;
 }
 
 void param_get_snapshot(param_config_t *out_config)
@@ -240,7 +253,7 @@ rt_bool_t param_has_persisted_config(void)
     return s_persisted_config;
 }
 
-rt_err_t param_save(void)
+static rt_err_t param_save_locked(void)
 {
     param_config_t verify;
     rt_uint8_t target_sec;
@@ -252,7 +265,6 @@ rt_err_t param_save(void)
     {
         return -RT_EINVAL;
     }
-    rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     target_sec = (s_active_sec == 0U) ? 1U : 0U;
     target_off = (target_sec == 0U) ? PARAM_SECTOR_A_OFF : PARAM_SECTOR_B_OFF;
     previous_revision = s_config.revision;
@@ -276,16 +288,27 @@ rt_err_t param_save(void)
     {
         s_config.revision = previous_revision;
         s_config.crc32 = param_calc_crc(&s_config);
-        rt_mutex_release(&s_param_lock);
         LOG_E("Configuration save/readback failed at sector %u", target_sec);
         return -RT_EIO;
     }
     s_active_sec = target_sec;
     s_persisted_config = RT_TRUE;
-    rt_mutex_release(&s_param_lock);
     LOG_I("Configuration schema %u revision %u saved to sector %u",
           PARAM_SCHEMA_VERSION, s_config.revision, s_active_sec);
     return RT_EOK;
+}
+
+rt_err_t param_save(void)
+{
+    rt_err_t result;
+    if (!s_param_inited)
+    {
+        return -RT_EINVAL;
+    }
+    rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
+    result = param_save_locked();
+    rt_mutex_release(&s_param_lock);
+    return result;
 }
 
 rt_err_t param_reset_factory(void)
@@ -294,8 +317,7 @@ rt_err_t param_reset_factory(void)
     rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     before = s_config;
     param_set_defaults(&s_config);
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, RT_TRUE);
+    return param_finish_update(&before, PARAM_SAVE_REQUIRED);
 }
 
 rt_err_t param_reset_operational(void)
@@ -318,8 +340,7 @@ rt_err_t param_reset_operational(void)
     s_config.reserved_flags[0] = before.reserved_flags[0];
     rt_memcpy(s_config.dev_hw_ver, hw_ver, sizeof(hw_ver));
     rt_memcpy(s_config.dev_sw_ver, sw_ver, sizeof(sw_ver));
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, RT_TRUE);
+    return param_finish_update(&before, PARAM_SAVE_REQUIRED);
 }
 
 rt_uint8_t param_get_work_mode(void)
@@ -327,7 +348,7 @@ rt_uint8_t param_get_work_mode(void)
     return s_config.work_mode;
 }
 
-rt_err_t param_set_work_mode(rt_uint8_t mode, rt_bool_t save_now)
+rt_err_t param_set_work_mode(rt_uint8_t mode, param_save_policy_t policy)
 {
     param_config_t before;
     if (mode > PARAM_MODE_RAW_UPLINK)
@@ -337,8 +358,7 @@ rt_err_t param_set_work_mode(rt_uint8_t mode, rt_bool_t save_now)
     rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     before = s_config;
     s_config.work_mode = mode;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, policy);
 }
 
 rt_uint8_t param_get_transfer_mode(void)
@@ -356,8 +376,7 @@ rt_err_t param_set_transfer_mode(rt_uint8_t mode, rt_bool_t save_now)
     rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     before = s_config;
     s_config.transfer_mode = mode;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 rt_uint32_t param_get_report_interval(void)
@@ -375,8 +394,7 @@ rt_err_t param_set_report_interval(rt_uint32_t seconds, rt_bool_t save_now)
     rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     before = s_config;
     s_config.report_interval_s = seconds;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 rt_uint32_t param_get_rs232_baud(void)
@@ -384,7 +402,7 @@ rt_uint32_t param_get_rs232_baud(void)
     return s_config.rs232_baud;
 }
 
-rt_err_t param_set_rs232_baud(rt_uint32_t baud, rt_bool_t save_now)
+rt_err_t param_set_rs232_baud(rt_uint32_t baud, param_save_policy_t policy)
 {
     param_config_t before;
     if (!param_baud_is_valid(baud))
@@ -394,8 +412,7 @@ rt_err_t param_set_rs232_baud(rt_uint32_t baud, rt_bool_t save_now)
     rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     before = s_config;
     s_config.rs232_baud = baud;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, policy);
 }
 
 const char *param_get_ntn_server(rt_uint16_t *out_port)
@@ -407,7 +424,7 @@ const char *param_get_ntn_server(rt_uint16_t *out_port)
     return s_config.host;
 }
 
-rt_err_t param_set_host(const char *host, rt_bool_t save_now)
+rt_err_t param_set_host(const char *host, param_save_policy_t policy)
 {
     param_config_t before;
     if (!param_host_is_valid(host))
@@ -418,11 +435,10 @@ rt_err_t param_set_host(const char *host, rt_bool_t save_now)
     before = s_config;
     rt_strncpy(s_config.host, host, sizeof(s_config.host) - 1U);
     s_config.host[sizeof(s_config.host) - 1U] = '\0';
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, policy);
 }
 
-rt_err_t param_set_ports(rt_uint16_t remote_port, rt_uint16_t local_port, rt_bool_t save_now)
+rt_err_t param_set_ports(rt_uint16_t remote_port, rt_uint16_t local_port, param_save_policy_t policy)
 {
     param_config_t before;
     if (remote_port == 0U)
@@ -433,8 +449,7 @@ rt_err_t param_set_ports(rt_uint16_t remote_port, rt_uint16_t local_port, rt_boo
     before = s_config;
     s_config.remote_port = remote_port;
     s_config.local_port = local_port;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, policy);
 }
 
 rt_err_t param_set_ntn_server(const char *host, rt_uint16_t port, rt_bool_t save_now)
@@ -449,8 +464,7 @@ rt_err_t param_set_ntn_server(const char *host, rt_uint16_t port, rt_bool_t save
     rt_strncpy(s_config.host, host, sizeof(s_config.host) - 1U);
     s_config.host[sizeof(s_config.host) - 1U] = '\0';
     s_config.remote_port = port;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 rt_bool_t param_endpoint_is_configured(void)
@@ -482,7 +496,7 @@ rt_uint32_t param_get_endpoint_identity(void)
     return hash;
 }
 
-rt_err_t param_set_apn(const char *apn, rt_bool_t save_now)
+rt_err_t param_set_apn(const char *apn, param_save_policy_t policy)
 {
     param_config_t before;
     rt_size_t i;
@@ -508,12 +522,11 @@ rt_err_t param_set_apn(const char *apn, rt_bool_t save_now)
     before = s_config;
     rt_strncpy(s_config.ntn_apn, apn, sizeof(s_config.ntn_apn) - 1U);
     s_config.ntn_apn[sizeof(s_config.ntn_apn) - 1U] = '\0';
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, policy);
 }
 
 rt_err_t param_set_dns(rt_uint8_t mode, const char *primary,
-                       const char *secondary, rt_bool_t save_now)
+                       const char *secondary, param_save_policy_t policy)
 {
     param_config_t before;
 
@@ -535,11 +548,10 @@ rt_err_t param_set_dns(rt_uint8_t mode, const char *primary,
     s_config.dns_primary[sizeof(s_config.dns_primary) - 1U] = '\0';
     rt_strncpy(s_config.dns_secondary, secondary, sizeof(s_config.dns_secondary) - 1U);
     s_config.dns_secondary[sizeof(s_config.dns_secondary) - 1U] = '\0';
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, policy);
 }
 
-rt_err_t param_set_rx_mode(rt_uint8_t mode, rt_bool_t save_now)
+rt_err_t param_set_rx_mode(rt_uint8_t mode, param_save_policy_t policy)
 {
     param_config_t before;
 
@@ -550,8 +562,7 @@ rt_err_t param_set_rx_mode(rt_uint8_t mode, rt_bool_t save_now)
     rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     before = s_config;
     s_config.rx_mode = mode;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, policy);
 }
 
 rt_err_t param_set_pc_cfg_enabled(rt_bool_t enabled, rt_bool_t save_now)
@@ -560,8 +571,7 @@ rt_err_t param_set_pc_cfg_enabled(rt_bool_t enabled, rt_bool_t save_now)
     rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     before = s_config;
     s_config.pc_cfg_enabled = enabled ? 1U : 0U;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 rt_err_t param_set_ntn_location_enabled(rt_bool_t enabled, rt_bool_t save_now)
@@ -570,8 +580,7 @@ rt_err_t param_set_ntn_location_enabled(rt_bool_t enabled, rt_bool_t save_now)
     rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     before = s_config;
     s_config.ntn_location_enabled = enabled ? 1U : 0U;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 rt_err_t param_set_asset_report(rt_bool_t enabled, rt_uint32_t period_s,
@@ -583,8 +592,7 @@ rt_err_t param_set_asset_report(rt_bool_t enabled, rt_uint32_t period_s,
     before = s_config;
     s_config.asset_report_enabled = enabled ? 1U : 0U;
     s_config.report_interval_s = period_s;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 rt_err_t param_set_location_report(rt_bool_t enabled, rt_uint32_t period_s,
@@ -596,8 +604,7 @@ rt_err_t param_set_location_report(rt_bool_t enabled, rt_uint32_t period_s,
     before = s_config;
     s_config.location_report_enabled = enabled ? 1U : 0U;
     s_config.location_interval_s = period_s;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 rt_err_t param_set_asset_location(rt_bool_t enabled, rt_bool_t save_now)
@@ -606,8 +613,7 @@ rt_err_t param_set_asset_location(rt_bool_t enabled, rt_bool_t save_now)
     rt_mutex_take(&s_param_lock, RT_WAITING_FOREVER);
     before = s_config;
     s_config.asset_location_enabled = enabled ? 1U : 0U;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 rt_err_t param_reserve_report_ids(rt_uint32_t count, rt_uint64_t *out_first_id)
@@ -625,8 +631,7 @@ rt_err_t param_reserve_report_ids(rt_uint32_t count, rt_uint64_t *out_first_id)
         return -RT_EFULL;
     }
     s_config.next_report_id += count;
-    rt_mutex_release(&s_param_lock);
-    result = param_finish_update(&before, RT_TRUE);
+    result = param_finish_update(&before, PARAM_SAVE_REQUIRED);
     if (result == RT_EOK) *out_first_id = first;
     return result;
 }
@@ -645,8 +650,7 @@ rt_err_t param_set_raw_pack(rt_uint16_t gap_ms, rt_uint16_t block_len,
     s_config.raw_gap_ms = gap_ms;
     s_config.raw_block_len = block_len;
     s_config.raw_wait_ms = wait_ms;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 const char *param_get_ble_name(void)
@@ -672,8 +676,7 @@ rt_err_t param_set_bt_name(const char *name,rt_uint8_t mode,rt_bool_t save_now)
     }
     before=s_config;
     rt_strcpy(s_config.ble_name,name);s_config.reserved_flags[0]=mode;
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before,save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 rt_err_t param_set_ble_name(const char *name,rt_bool_t save_now)
 {
@@ -712,8 +715,7 @@ rt_err_t param_set_dev_sn(const char *sn, rt_bool_t save_now)
     before = s_config;
     rt_strncpy(s_config.dev_sn, sn, sizeof(s_config.dev_sn) - 1U);
     s_config.dev_sn[sizeof(s_config.dev_sn) - 1U] = '\0';
-    rt_mutex_release(&s_param_lock);
-    return param_finish_update(&before, save_now);
+    return param_finish_update(&before, save_now ? PARAM_SAVE_REQUIRED : PARAM_SAVE_RAM_ONLY);
 }
 
 int param_manager_init(void)

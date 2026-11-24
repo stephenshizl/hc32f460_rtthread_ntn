@@ -346,8 +346,7 @@ static void at_line_reset_locked(void)
 
 static void local_action_apply(const mcu_cmd_action_t *action)
 {
-    char final_response[192];
-    rt_err_t result;
+    char final_response[96];
 
     if (action->type != MCU_CMD_ACTION_APPLY_RS232_BAUD)
     {
@@ -355,19 +354,7 @@ static void local_action_apply(const mcu_cmd_action_t *action)
     }
     /* The pending response is written at the old rate before this delay. */
     rt_thread_mdelay(500U);
-    result = pc_rs232_set_baudrate(action->value);
-    if (result != RT_EOK)
-    {
-        (void)param_set_rs232_baud(action->previous_value, RT_TRUE);
-        rt_snprintf(final_response, sizeof(final_response),
-                    "\r\n+MCUERROR:3\r\nERROR\r\n");
-    }
-    else
-    {
-        rt_snprintf(final_response, sizeof(final_response),
-                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"baud\":%u}\r\nOK\r\n",
-                    action->value);
-    }
+    mcu_local_cmd_complete_baud(action->value, RT_TRUE, final_response, sizeof(final_response));
     pc_rs232_send_str(final_response);
 }
 

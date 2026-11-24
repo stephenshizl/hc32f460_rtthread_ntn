@@ -49,9 +49,7 @@ static void maint_raw(void *user, const uint8_t *data, size_t len)
 static void maint_local_command(void *user, const uint8_t *data, size_t len)
 {
     char response[2048];
-    char final_response[160];
     mcu_cmd_action_t action;
-    rt_err_t ret;
     RT_UNUSED(user);
     if (!mcu_local_cmd_execute(data, (rt_size_t)len, response,
                                sizeof(response), &action))
@@ -64,18 +62,8 @@ static void maint_local_command(void *user, const uint8_t *data, size_t len)
     if (action.type != MCU_CMD_ACTION_APPLY_RS232_BAUD) return;
     /* PENDING is sent at old baud; TX has 500 ms to drain before switching. */
     rt_thread_mdelay(500U);
-    ret = pc_rs232_set_baudrate(action.value);
-    if (ret == RT_EOK)
-        rt_snprintf(final_response, sizeof(final_response),
-                    "\r\n+MCUAPPLY:{\"state\":\"APPLIED\",\"baud\":%u}\r\nOK\r\n",
-                    action.value);
-    else
-    {
-        (void)param_set_rs232_baud(action.previous_value, RT_TRUE);
-        rt_snprintf(final_response, sizeof(final_response),
-                    "\r\n+MCUERROR:3\r\nERROR\r\n");
-    }
-    pc_rs232_send_str(final_response);
+    mcu_local_cmd_complete_baud(action.value, RT_TRUE, response, sizeof(response));
+    pc_rs232_send_str(response);
 }
 
 static const pc_maint_callbacks_t s_maint_callbacks = {
@@ -146,7 +134,7 @@ rt_bool_t app_telemetry_pc_config_active(void)
 
 void app_telemetry_set_mode(rt_uint8_t mode)
 {
-    if (param_set_work_mode(mode, RT_TRUE) == RT_EOK)
+    if (param_set_work_mode(mode, PARAM_SAVE_REQUIRED) == RT_EOK)
     {
         ntn_bridge_set(mode == PARAM_MODE_AT_PASSTHROUGH);
         if (mode == PARAM_MODE_RAW_UPLINK)

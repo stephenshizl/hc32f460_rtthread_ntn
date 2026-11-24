@@ -30,7 +30,7 @@
 
 static int sys_reboot(int argc, char **argv)
 {
-    mcu_cmd_action_t action = {MCU_CMD_ACTION_REBOOT, 0U, 0U};
+    mcu_cmd_action_t action = { .type = MCU_CMD_ACTION_REBOOT };
     RT_UNUSED(argv);
     if (argc != 1)
     {
