@@ -3,6 +3,7 @@
 #include "mcu_local_cmd.h"
 #include "bt_identity.h"
 #include "app_telemetry.h"
+#include "app_flash.h"
 #include "param_manager.h"
 #include "pc_rs232.h"
 #include "raw_uplink.h"
@@ -103,8 +104,9 @@ static rt_bool_t handle_capability(const char *cmd, char *out, rt_size_t out_siz
                 "\"rx_push\":true,\"rx_push_verified\":false,"
                 "\"downlink_to_rs232\":false,"
 #ifdef NTN_OTA_APP
-                "\"upgrade\":true,\"ota_layout\":%u,\"boot_abi\":%u,\"recovery_baud\":19200,"
+                "\"upgrade\":true,\"ota_storage_ready\":%s,\"ota_layout\":%u,\"boot_abi\":%u,\"recovery_baud\":19200,"
                 "\"ota_max\":%u,\"raw_max\":256}\r\nOK\r\n",
+                app_flash_get_partition("download") && app_flash_get_partition("ota_scratch") ? "true" : "false",
                 NTN_OTA_LAYOUT_ID, NTN_OTA_BOOT_ABI, NTN_OTA_PACKAGE_MAX);
 #else
                 "\"upgrade\":false,\"raw_max\":256}\r\nOK\r\n");
@@ -785,11 +787,11 @@ static rt_bool_t handle_status(const char *cmd, char *out, rt_size_t out_size)
     rt_bool_t gnss_fixed;
     rt_uint32_t gnss_age_ms;
 
-    if (!(cmd_is_query(cmd, "AT+MCUSTAT") || cmd_is_query(cmd, "AT+MCUQUEUE")))
+    rt_bool_t selftest = cmd_is_query(cmd, "AT+MCUSELFTEST");
+    if (!(selftest || cmd_is_query(cmd, "AT+MCUSTAT") || cmd_is_query(cmd, "AT+MCUQUEUE")))
     {
         return RT_FALSE;
     }
-    raw_uplink_get_stats(&raw);
     ntn_service_get_status(&ntn);
     store_forward_get_stats(&flash);
     param_get_snapshot(&cfg);
@@ -797,6 +799,20 @@ static rt_bool_t handle_status(const char *cmd, char *out, rt_size_t out_size)
     gnss_age_ms = gnss.last_update_tick == 0U ? 0xFFFFFFFFUL :
         (rt_uint32_t)(((rt_uint64_t)(rt_tick_get() - gnss.last_update_tick) * 1000U) /
                       RT_TICK_PER_SECOND);
+    if (selftest)
+    {
+        rt_snprintf(out, out_size,
+                    "\r\n+MCUSELFTEST:{\"sn\":\"%s\",\"nor_ready\":%s,"
+                    "\"queue_ready\":%s,\"config_saved\":%s,"
+                    "\"gnss_valid\":%s,\"registered\":%u,\"ntn_error\":%d}\r\nOK\r\n",
+                    cfg.dev_sn, app_flash_get_partition("kvdb") ? "true" : "false",
+                    store_forward_is_ready() && !flash.storage_fault ? "true" : "false",
+                    param_has_persisted_config() ? "true" : "false",
+                    gnss_fixed && gnss_age_ms <= 5000U ? "true" : "false",
+                    ntn.reg_status, ntn.last_error);
+        return RT_TRUE;
+    }
+    raw_uplink_get_stats(&raw);
     rt_snprintf(out, out_size,
                 "\r\n+MCUSTAT:{\"mode\":%u,\"ntn_state\":%u,\"registered\":%u,"
                 "\"socket_open\":%s,\"host\":\"%s\",\"rx_mode\":%u,"
@@ -1049,6 +1065,11 @@ static rt_bool_t handle_reboot(const char *cmd, char *out, rt_size_t out_size,
     }
     if (rt_strcmp(cmd, "AT+MCUOTA=BOOT") == 0)
     {
+        if (!app_flash_get_partition("download") || !app_flash_get_partition("ota_scratch"))
+        {
+            cmd_error(out, out_size, 8);
+            return RT_TRUE;
+        }
         if (!ntn_ota_is_confirmed())
         {
             cmd_error(out, out_size, 2);

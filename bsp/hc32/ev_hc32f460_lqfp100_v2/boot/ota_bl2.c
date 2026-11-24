@@ -271,6 +271,48 @@ static void handoff(void)
     ntn_ota_jump(NTN_OTA_APP_VECTOR);
 }
 
+static bool confirmed_primary_without_nor(void)
+{
+    const struct flash_area *primary;
+    struct boot_swap_state swap;
+    struct image_header header;
+    uint32_t extent;
+
+    if (flash_area_open(FLASH_AREA_IMAGE_PRIMARY(0), &primary) ||
+        boot_read_swap_state(primary, &swap) || swap.magic != BOOT_MAGIC_GOOD ||
+        swap.image_ok != BOOT_FLAG_SET)
+        return false;
+
+    /* A completed swap has copy_done. A factory image has an untouched
+     * status area before image_ok. Scratch-only preparation can coexist
+     * with the latter, but MCUboot erases the primary trailer before it
+     * replaces primary image data. Leave all swap records intact. */
+    if (swap.copy_done != BOOT_FLAG_SET)
+    {
+        uint32_t erased[16];
+
+        if (swap.copy_done != BOOT_FLAG_UNSET || swap.swap_type != BOOT_SWAP_TYPE_NONE)
+            return false;
+        for (uint32_t offset = NTN_OTA_PACKAGE_MAX; offset < NTN_OTA_IMAGE_OK_OFF;)
+        {
+            uint32_t count = NTN_OTA_IMAGE_OK_OFF - offset;
+            if (count > sizeof(erased))
+                count = sizeof(erased);
+            if (flash_area_read(primary, offset, erased, count))
+                return false;
+            for (uint32_t i = 0; i < count / sizeof(erased[0]); ++i)
+                if (erased[i] != UINT32_MAX)
+                    return false;
+            offset += count;
+        }
+    }
+
+    /* The validator uses board-defined sector geometry and reads only this
+     * image, so it can check the signature without opening the QSPI bus. */
+    extent = image_extent(primary, &header);
+    return extent != 0U && ntn_ota_check_image(primary, extent);
+}
+
 int main(void)
 {
     struct boot_rsp response;
@@ -320,8 +362,11 @@ int main(void)
             rt_thread_mdelay(10);
         }
     }
-    /* Scratch can hold the only authoritative swap record. Without NOR the
-     * primary trailer alone cannot prove that there is no interrupted swap. */
+    if (confirmed_primary_without_nor())
+    {
+        ntn_ota_report_boot_error("BOOT2 WARN NOR_INIT_FALLBACK_PRIMARY\r\n");
+        handoff();
+    }
     ntn_ota_report_boot_error("BOOT2 ERROR NOR_INIT\r\n");
     for (;;)
         rt_thread_mdelay(1000);

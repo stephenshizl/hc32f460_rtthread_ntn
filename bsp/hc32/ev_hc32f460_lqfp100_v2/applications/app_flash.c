@@ -19,6 +19,9 @@
 #endif
 #define DBG_TAG "app.flash"
 #define DBG_LVL DBG_INFO
+#ifdef NTN_OTA_BL2
+#define DBG_ENABLE
+#endif
 #include <rtdbg.h>
 
 #ifndef FAL_USING_NOR_FLASH_DEV_NAME
